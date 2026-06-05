@@ -1,0 +1,23 @@
+﻿# User-requested exclusions
+docs/
+backend/.env
+chwl-agent-main (2)/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Node / frontend
+node_modules/
+dist/
+frontend/node_modules/
+frontend/dist/
+
+# Logs and runtime artifacts
+*.log
+.env
+.DS_Store
+Thumbs.db
