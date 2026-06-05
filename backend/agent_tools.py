@@ -113,6 +113,36 @@ PLANNING_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "estimate_routes",
+            "description": (
+                "估算多个行程节点之间的连续路线耗时。只用于检查通勤时间和路线可行性，"
+                "不要因此固定用户行程路线；最终节点仍应根据用户偏好和 POI 选择生成。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {
+                        "type": "string",
+                        "description": "起点 POI ID，如 home/current_location 或上一节点 poi_id",
+                    },
+                    "destinations": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "按计划访问顺序排列的目的地 POI ID 列表",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["taxi", "walk", "transit"],
+                        "description": "交通方式，默认 taxi",
+                    },
+                },
+                "required": ["origin", "destinations"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish_planning",
             "description": (
                 "收集足够数据后调用此工具提交最终行程方案。"
@@ -248,10 +278,20 @@ async def execute_tool(name: str, args: dict,
         elif name == "get_booking_status":
             return await tools.get_booking_status(poi_id=args["poi_id"])
 
+        elif name in ("estimate_routes", "route_check"):
+            destinations = args.get("destinations") or []
+            if isinstance(destinations, str):
+                destinations = [d.strip() for d in destinations.split(",") if d.strip()]
+            return await tools.get_routes(
+                origin=args.get("origin", args.get("from_poi", "current_location")),
+                destinations=destinations,
+                mode=args.get("mode", args.get("transport_mode", "taxi")),
+            )
+
         elif name == "estimate_route":
             return await tools.get_route(
-                from_id=args["from_poi"],
-                to_id=args["to_poi"],
+                from_id=args.get("from_poi", args.get("origin", "current_location")),
+                to_id=args.get("to_poi", args.get("destination", "")),
                 mode=args.get("mode", "taxi"),
             )
 
@@ -298,5 +338,10 @@ def summarize_tool_result(name: str, result: dict) -> str:
         dur = result.get("duration_min", result.get("estimated_time_min", "?"))
         dist = result.get("distance_km", "?")
         return f"路程约 {dist} km，{dur} 分钟"
+
+    if name in ("estimate_routes", "route_check"):
+        total = result.get("total_travel_time_min", "?")
+        segments = result.get("segments", [])
+        return f"路线共约 {total} 分钟，{len(segments)} 段"
 
     return str(result)[:80]

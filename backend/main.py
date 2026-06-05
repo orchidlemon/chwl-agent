@@ -21,7 +21,7 @@ from fastapi.responses import StreamingResponse
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from backend.schemas import (
-    ChatRequest, ExceptionConfirmRequest, InjectEventTextRequest,
+    ChatRequest, ConfirmationResolveRequest, ExceptionConfirmRequest, InjectEventTextRequest,
     MemoryUpdateRequest, NodeActionRequest, NodeCheckinRequest,
     PlanRequest, ReportRequest,
 )
@@ -80,6 +80,8 @@ async def create_session():
 
 @app.delete("/agent/{session_id}/reset")
 async def reset_session(session_id: str):
+    await orchestrator.stop_background_watch(session_id)
+    await orchestrator.cancel_confirmations(session_id)
     manager.reset(session_id)
     return {"status": "reset", "session_id": session_id}
 
@@ -150,6 +152,21 @@ async def confirm_exception(session_id: str, req: ExceptionConfirmRequest):
     return sse_response(orchestrator.run_exception_confirm(session_id, req.dict()))
 
 
+@app.post("/agent/{session_id}/confirmation/resolve")
+async def resolve_confirmation(session_id: str, req: ConfirmationResolveRequest):
+    s = manager.get(session_id)
+    if not s:
+        raise HTTPException(404, "Session not found")
+    resolved = await orchestrator.confirmation_gateway.resolve(
+        session_id,
+        req.request_id,
+        req.approved,
+        req.modifications or {},
+        reason=req.reason or "",
+    )
+    return {"resolved": bool(resolved), "request": resolved.to_dict() if resolved else None}
+
+
 # ── Node actions ──────────────────────────────────────────────────────
 
 @app.post("/agent/{session_id}/node/action")
@@ -162,6 +179,20 @@ async def node_action(session_id: str, req: NodeActionRequest):
     target = next((n for n in itinerary if n["id"] == req.node_id), None)
 
     if target and req.action in ("delete", "replace"):
+        if req.force:
+            pending = (
+                orchestrator.confirmation_gateway.get_pending(session_id, req.request_id)
+                if req.request_id else
+                orchestrator.confirmation_gateway.find_latest_pending(session_id, "node_action")
+            )
+            if pending and pending.get("context", {}).get("node_id") == req.node_id:
+                await orchestrator.confirmation_gateway.resolve(
+                    session_id,
+                    pending["request_id"],
+                    True,
+                    {"action": req.action},
+                )
+
         # Hard-block: completed_lock nodes are immutable
         if target.get("completed_lock"):
             return {"blocked": True, "reason": "该节点已完成打卡，无法修改", "nodes": itinerary}
@@ -176,8 +207,21 @@ async def node_action(session_id: str, req: NodeActionRequest):
             else:
                 reason = (f"「{node_name}」预约资格已锁定，"
                           f"取消后名额将立即释放，当前时段余量有限，再次预约成功率较低。")
+            confirm_req = await orchestrator.confirmation_gateway.request(
+                session_id,
+                "node_action",
+                {"node_id": req.node_id, "action": req.action},
+                title="确认释放已锁定资源",
+                description=reason,
+                options=[
+                    {"label": "确认继续", "value": "approve", "recommended": False},
+                    {"label": "保留原方案", "value": "reject", "recommended": True},
+                ],
+                timeout_s=120,
+            )
             return {
                 "soft_lock_warning": True,
+                "request_id": confirm_req.request_id,
                 "reason":  reason,
                 "node_id": req.node_id,
                 "action":  req.action,

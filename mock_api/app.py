@@ -93,6 +93,38 @@ _SCENARIO_ACCEPTED = {
 }
 
 
+# Virtual category aliases: a requested category name maps to real category names
+# AND optional feature-field checks.
+_CATEGORY_ALIASES = {
+    "mall": {
+        "categories": {"mall_exhibition"},
+        "activity_features": {"mall"},
+        "location_features": {"mall"},
+    },
+    "indoor": {
+        "categories": {"indoor_playground", "board_game", "picture_book_library",
+                       "children_science", "exhibition", "livehouse", "mall_exhibition"},
+    },
+}
+
+
+def _item_matches_category(item, categories):
+    """Return True if item's category matches the requested list, respecting aliases."""
+    item_cat = item.get("category", "")
+    for cat in categories:
+        if cat == item_cat:
+            return True
+        alias = _CATEGORY_ALIASES.get(cat)
+        if alias:
+            if item_cat in alias.get("categories", set()):
+                return True
+            if any(f in item.get("activity_features", []) for f in alias.get("activity_features", set())):
+                return True
+            if any(f in item.get("location_features", []) for f in alias.get("location_features", set())):
+                return True
+    return False
+
+
 def filter_by_common_params(items, query):
     scenario = first(query, "scenario")
     categories = split_csv(first(query, "categories", ""))
@@ -105,7 +137,7 @@ def filter_by_common_params(items, query):
     for item in items:
         if accepted and item.get("scenario") not in accepted:
             continue
-        if categories and item.get("category") not in categories:
+        if categories and not _item_matches_category(item, categories):
             continue
         if radius is not None and item.get("distance_km", 0) > radius:
             continue

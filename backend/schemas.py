@@ -21,16 +21,25 @@ class FulfillRequest(BaseModel):
 
 class ExceptionConfirmRequest(BaseModel):
     confirmed: bool = True
+    request_id: Optional[str] = None
     exception_type: str = "queue_spike"
     original_node_id: Optional[str] = None
     alternative: Optional[dict] = None
     recommended: Optional[dict] = None
 
 
+class ConfirmationResolveRequest(BaseModel):
+    request_id: str
+    approved: bool = False
+    modifications: Optional[dict] = None
+    reason: Optional[str] = None
+
+
 class NodeActionRequest(BaseModel):
     node_id: str
     action: str          # "delete" | "pin" | "replace"
     force: bool = False  # True = bypass soft_lock warning (user already confirmed)
+    request_id: Optional[str] = None
 
 
 class ReportRequest(BaseModel):

@@ -66,9 +66,29 @@ export default function App() {
     }
   }, [sessionId])
 
-  const handleProfileUpdate = useCallback((data) => {
-    setUserProfile(prev => ({ ...prev, ...data }))
+  const mergeProfilePart = useCallback((prevPart, nextPart) => {
+    if (!nextPart) return prevPart
+    const merged = { ...(prevPart || {}) }
+    Object.entries(nextPart).forEach(([key, value]) => {
+      if (Array.isArray(value)) {
+        const oldValues = Array.isArray(merged[key]) ? merged[key] : []
+        merged[key] = [...new Set([...oldValues, ...value])]
+      } else if (value !== null && value !== undefined && value !== '') {
+        merged[key] = value
+      } else if (!(key in merged)) {
+        merged[key] = value
+      }
+    })
+    return merged
   }, [])
+
+  const handleProfileUpdate = useCallback((data) => {
+    setUserProfile(prev => ({
+      facts: mergeProfilePart(prev.facts, data.facts),
+      preferences: mergeProfilePart(prev.preferences, data.preferences),
+      phase: data.phase || prev.phase,
+    }))
+  }, [mergeProfilePart])
 
   // ── Transit pending / confirm ─────────────────────────────────────
 

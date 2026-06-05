@@ -7,7 +7,7 @@ const BASE = '/agent'
 
 // ── Session ─────────────────────────────────────────────────────────
 
-const SESSION_KEY = 'meituan_agent_session_id'
+const SESSION_KEY = 'meituan_agent_session_id_v3'
 
 export async function getOrCreateSession() {
   let sid = localStorage.getItem(SESSION_KEY)
@@ -30,37 +30,51 @@ export function clearSession() {
 
 // ── SSE streaming helper ─────────────────────────────────────────────
 
-export async function streamPost(url, payload, onEvent) {
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: payload != null ? JSON.stringify(payload) : undefined,
-  })
+export async function streamPost(url, payload, onEvent, timeoutMs = 120000) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
 
-  if (!resp.ok) {
-    onEvent({ type: 'error', message: `HTTP ${resp.status}` })
-    return
-  }
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payload != null ? JSON.stringify(payload) : undefined,
+      signal: controller.signal,
+    })
 
-  const reader = resp.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
-
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buf += decoder.decode(value, { stream: true })
-    const parts = buf.split('\n\n')
-    buf = parts.pop()
-    for (const chunk of parts) {
-      const line = chunk.trim()
-      if (!line.startsWith('data: ')) continue
-      try {
-        const evt = JSON.parse(line.slice(6))
-        onEvent(evt)
-        if (evt.type === 'done' || evt.type === 'stream_end') return
-      } catch (_) {}
+    if (!resp.ok) {
+      onEvent({ type: 'error', message: `HTTP ${resp.status}` })
+      return
     }
+
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const parts = buf.split('\n\n')
+      buf = parts.pop()
+      for (const chunk of parts) {
+        const line = chunk.trim()
+        if (!line.startsWith('data: ')) continue
+        try {
+          const evt = JSON.parse(line.slice(6))
+          onEvent(evt)
+          if (evt.type === 'done' || evt.type === 'stream_end') return
+        } catch (_) {}
+      }
+    }
+  } catch (err) {
+    const isAbort = err?.name === 'AbortError'
+    onEvent({
+      type: 'error',
+      message: isAbort ? '请求超时，已停止等待。你可以重新规划。' : err.message,
+    })
+  } finally {
+    clearTimeout(timeout)
   }
 }
 
@@ -91,13 +105,24 @@ export function streamExceptionConfirm(sessionId, payload, onEvent) {
   return streamPost(`${BASE}/${sessionId}/exception/confirm`, payload, onEvent)
 }
 
+export async function resolveConfirmation(sessionId, requestId, approved = false, modifications = {}, reason = '') {
+  const r = await fetch(`${BASE}/${sessionId}/confirmation/resolve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ request_id: requestId, approved, modifications, reason }),
+  })
+  return r.json()
+}
+
 // ── Node actions ───────────────────────────────────────────────────────
 
-export async function nodeAction(sessionId, nodeId, action, force = false) {
+export async function nodeAction(sessionId, nodeId, action, force = false, requestId = null) {
+  const payload = { node_id: nodeId, action, force }
+  if (requestId) payload.request_id = requestId
   const r = await fetch(`${BASE}/${sessionId}/node/action`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ node_id: nodeId, action, force }),
+    body: JSON.stringify(payload),
   })
   return r.json()
 }

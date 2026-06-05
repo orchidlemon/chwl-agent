@@ -1,4 +1,4 @@
-﻿"""Main Agent orchestration. Each flow is an async generator yielding SSE events."""
+"""Main Agent orchestration. Each flow is an async generator yielding SSE events."""
 import asyncio
 import json
 import logging
@@ -9,9 +9,15 @@ import uuid
 from typing import AsyncGenerator
 
 from . import skills, tools
+from .background_watch import BackgroundWatch, build_watch_configs_for_itinerary
+from .confirmation_gateway import ConfirmationGateway
+from .output_validator import validate_itinerary_nodes
 from .session import SessionManager
 
 logger = logging.getLogger(__name__)
+PLANNING_STALE_SECONDS = 90
+REPLAN_WORDS = ("重新规划", "重规划", "换方案", "重来")
+STUCK_WORDS = ("卡住", "超时", "没结果", "一直", "不动", "等这一轮")
 
 
 def _emit(type_: str, **data) -> dict:
@@ -25,6 +31,8 @@ def _voucher_code() -> str:
 class Orchestrator:
     def __init__(self, manager: SessionManager):
         self.manager = manager
+        self.confirmation_gateway = ConfirmationGateway(manager)
+        self.background_watch = BackgroundWatch(manager, self.confirmation_gateway)
 
     # ── Flow 0: Smart Chat (phase-aware entry point) ─────────────────
 
@@ -40,20 +48,50 @@ class Orchestrator:
           use original_request to re-clarify+plan in one shot without another user round.
         """
         phase = self.manager.get_phase(session_id)
+        session = self.manager.get(session_id) or {}
         logger.info(f"run_chat phase={phase} hint={phase_hint} session={session_id[:8]}")
+
+        if phase == "planning" and self._planning_is_stale(session):
+            self.manager.set_phase(session_id, "needs_replan")
+            self.manager.add_monitor_event(
+                session_id,
+                "main_agent",
+                "规划超时，已允许用户重新规划",
+                "planning_timeout",
+            )
+            phase = self.manager.get_phase(session_id)
+            session = self.manager.get(session_id) or {}
+
+        # Pending exception has priority over ordinary planning/chat routes.
+        pending_exception = session.get("pending_exception")
+        if pending_exception and phase in ("monitoring", "needs_replan") and phase_hint != "start_plan":
+            yield _emit(
+                "monitor_alert",
+                content=pending_exception.get("message", "当前行程有异常需要先处理。"),
+                severity=pending_exception.get("severity", "medium"),
+            )
+            yield _emit(
+                "text",
+                content="当前有一个行程异常待确认，我会优先处理它。请先在异常卡片里确认是否切换方案，再继续提出新的调整。",
+            )
+            yield _emit("done")
+            return
+
+        if phase_hint == "new_round":
+            await self._prepare_next_round(session_id)
+            yield _emit("text", content="收到，我会在本页面开启新一轮规划。")
+            async for evt in self._run_clarify(session_id, message):
+                yield evt
+            return
 
         # ── "开始规划" button was clicked ──────────────────────────────
         if phase_hint == "start_plan":
             if phase == "confirming":
-                # Normal path: session intact, go to confirm+plan
                 async for evt in self._run_confirm_and_plan(session_id, message):
                     yield evt
-            else:
-                # Session was reset (e.g. dev reload) — re-run clarify with the
-                # original request so we immediately have context, then plan.
+            elif phase == "gathering":
                 src = original_request or message
                 if not original_request:
-                    # We have no context; prompt user to re-enter
                     yield _emit("clarify",
                                 message="抱歉，刚刚服务重启了，麻烦重新告诉我你的出行需求～"
                                         "\n比如：「今天下午2点，带孩子去玩」",
@@ -61,9 +99,28 @@ class Orchestrator:
                                 phase="confirming")
                     yield _emit("done")
                     return
-                # Re-clarify using original request, then immediately plan
                 async for evt in self._run_clarify_and_plan(session_id, src):
                     yield evt
+            elif phase == "planning":
+                if self._message_requests_replan(message):
+                    self._mark_planning_failed(session_id, "用户打断卡住的规划")
+                    yield _emit("text", content="收到，上一轮规划看起来卡住了。我现在重新开始规划。")
+                    async for evt in self._run_monitoring_chat(session_id, "重新规划"):
+                        yield evt
+                else:
+                    yield _emit("text", content="我还在规划中。如果一直没有结果，直接说「重新规划」我会立刻重来。")
+                    yield _emit("done")
+            elif phase in ("monitoring", "needs_replan"):
+                async for evt in self._run_monitoring_chat(session_id, message):
+                    yield evt
+            elif phase == "completed":
+                await self._prepare_next_round(session_id)
+                src = original_request or message
+                async for evt in self._run_clarify_and_plan(session_id, src):
+                    yield evt
+            else:
+                yield _emit("text", content="当前行程已取消或不可继续，请重置会话后重新规划。")
+                yield _emit("done")
             return
 
         # ── Normal routing by phase ────────────────────────────────────
@@ -71,13 +128,43 @@ class Orchestrator:
             async for evt in self._run_clarify(session_id, message):
                 yield evt
         elif phase == "confirming":
-            # User typed a refinement — update inference, re-show clarify + button
-            # (Planning only starts when user explicitly clicks "开始规划")
             async for evt in self._run_refine_clarify(session_id, message):
                 yield evt
-        else:
+        elif phase == "planning":
+            if self._message_requests_replan(message):
+                self._mark_planning_failed(session_id, "用户打断卡住的规划")
+                yield _emit("text", content="收到，上一轮规划看起来卡住了。我现在重新开始规划。")
+                async for evt in self._run_monitoring_chat(session_id, "重新规划"):
+                    yield evt
+            else:
+                yield _emit("text", content="我正在规划中。如果刚才那轮卡住了，直接说「重新规划」，我会重新开始。")
+                yield _emit("done")
+        elif phase in ("monitoring", "needs_replan"):
             async for evt in self._run_monitoring_chat(session_id, message):
                 yield evt
+        elif phase == "completed":
+            await self._prepare_next_round(session_id)
+            yield _emit("text", content="上一轮已经完成，我会在本页面为你开启新一轮规划。")
+            async for evt in self._run_clarify(session_id, message):
+                yield evt
+        elif phase == "cancelled":
+            yield _emit("text", content="当前行程已取消，请重置会话后重新开始。")
+            yield _emit("done")
+        else:
+            self.manager.set_phase(session_id, "gathering")
+            async for evt in self._run_clarify(session_id, message):
+                yield evt
+
+    async def _prepare_next_round(self, session_id: str) -> None:
+        await self.stop_background_watch(session_id)
+        await self.cancel_confirmations(session_id)
+        self.manager.reset_for_next_round(session_id)
+        self.manager.add_monitor_event(
+            session_id,
+            "main_agent",
+            "上一轮已完成，已在同一会话开启新一轮规划",
+            "next_round",
+        )
 
     # ── Fast-path: clarify + plan in one shot (session recovery) ─────
 
@@ -90,21 +177,33 @@ class Orchestrator:
         result = await skills.clarify_needs(message, current_time)
         inferred = result.get("inferred", {})
 
-        # Confirm prefs using a silent "yes" response
-        confirmed = await skills.confirm_preferences(inferred, "好的，就按这个规划")
-        session_facts = confirmed.get("session_facts", {})
-        preferences   = confirmed.get("preferences", {})
+        base_preferences = {
+            "food": inferred.get("food_preferences", []),
+            "venue": inferred.get("venue_preference"),
+            "skip_restaurant": inferred.get("skip_restaurant", False),
+        }
+        session_facts, preferences = skills.merge_confirmed_state(
+            inferred,
+            base_preferences,
+            {},
+            {},
+            message,
+        )
 
         self.manager.update_memory(session_id, "session_facts", session_facts)
         self.manager.update_memory(session_id, "derived_preferences", preferences)
-        self.manager.set_phase(session_id, "planning")
+        self._mark_planning_started(session_id)
         self.manager.add_monitor_event(
             session_id, "main_agent",
             f"服务重启恢复：重新识别请求，场景={session_facts.get('scenario')}，直接规划",
             "session_recovery"
         )
 
-        yield _emit("confirmed", message=confirmed.get("start_message", "好的，马上帮你规划！"))
+        yield _emit("confirmed",
+                    message=skills.append_confirmed_requirements("好的，马上帮你规划！", session_facts, preferences),
+                    facts=session_facts,
+                    preferences=preferences,
+                    phase="planning")
         async for evt in self._run_plan_core(session_id, session_facts, preferences):
             yield evt
 
@@ -130,9 +229,26 @@ class Orchestrator:
         inferred = result.get("inferred", {})
         if loc.get("address"):
             inferred["detected_location"] = loc["address"]
+            inferred.setdefault("home_area", loc.get("district") or loc.get("address"))
+
+        inferred_prefs = {
+            "food": inferred.get("food_preferences", []),
+            "venue": inferred.get("venue_preference"),
+            "skip_restaurant": inferred.get("skip_restaurant", False),
+        }
+        inferred, inferred_prefs = skills.merge_confirmed_state(
+            inferred,
+            inferred_prefs,
+            {},
+            {},
+            message,
+        )
 
         self.manager.set_pending_inference(session_id, inferred)
         self.manager.set_phase(session_id, "confirming")
+        # Store original message for context-aware refinement later
+        self.manager.clear_clarify_history(session_id)
+        self.manager.append_clarify_message(session_id, message)
 
         self.manager.add_monitor_event(
             session_id, "main_agent",
@@ -147,7 +263,11 @@ class Orchestrator:
             or (isinstance(confidence, (int, float)) and confidence >= 0.8)
         ) and len(missing) == 0
 
-        base_msg = result.get("confirm_message", "请告诉我更多出行信息～")
+        base_msg = skills.append_confirmed_requirements(
+            result.get("confirm_message", "请告诉我更多出行信息～"),
+            inferred,
+            inferred_prefs,
+        )
         if all_clear:
             msg = base_msg + "\n\n信息都齐了！直接点「开始规划」，我马上帮你安排 👇"
         else:
@@ -158,10 +278,7 @@ class Orchestrator:
                     ready_to_plan=True,
                     phase="confirming",
                     facts=inferred,
-                    preferences={
-                        "food": inferred.get("food_preferences", []),
-                        "venue": inferred.get("venue_preference"),
-                    })
+                    preferences=inferred_prefs)
         yield _emit("done")
 
     # ── Phase: confirming (refinement) ──────────────────────────────
@@ -170,9 +287,27 @@ class Orchestrator:
         Update the pending inference and re-emit clarify (button stays visible).
         """
         inferred = self.manager.get_pending_inference(session_id) or {}
-        confirmed = await skills.confirm_preferences(inferred, message)
-        updated_facts = confirmed.get("session_facts", {})
-        updated_preferences = confirmed.get("preferences", {})
+        current_memory = self.manager.get_memory(session_id)
+        previous_facts = current_memory.get("session_facts", {})
+        previous_preferences = current_memory.get("derived_preferences", {})
+        # Bootstrap previous_preferences from inferred so LLM null-return won't wipe venue/food
+        if not previous_preferences:
+            previous_preferences = {
+                "food": inferred.get("food_preferences", []),
+                "venue": inferred.get("venue_preference"),
+                "skip_restaurant": inferred.get("skip_restaurant", False),
+            }
+        # Append this message then pass full history so LLM can resolve references like "按老婆的来"
+        self.manager.append_clarify_message(session_id, message)
+        history = self.manager.get_clarify_history(session_id)
+        confirmed = await skills.confirm_preferences(inferred, message, history=history)
+        updated_facts, updated_preferences = skills.merge_confirmed_state(
+            previous_facts or inferred,
+            previous_preferences,
+            confirmed.get("session_facts", {}),
+            confirmed.get("preferences", {}),
+            message,
+        )
 
         # Persist the updated inference so "开始规划" uses fresh data
         if updated_facts:
@@ -182,7 +317,11 @@ class Orchestrator:
             self.manager.update_memory(session_id, "derived_preferences", updated_preferences)
 
         # Build a short acknowledgement + prompt to start planning
-        ack = confirmed.get("start_message", "好的，已更新！")
+        ack = skills.append_confirmed_requirements(
+            confirmed.get("start_message", "好的，已更新！"),
+            updated_facts or inferred,
+            updated_preferences,
+        )
         yield _emit("clarify",
                     message=f"{ack}\n\n信息确认好了吗？点击下方「开始规划」，我马上帮你安排 👇",
                     ready_to_plan=True,
@@ -196,19 +335,31 @@ class Orchestrator:
     async def _run_confirm_and_plan(self, session_id: str, message: str) -> AsyncGenerator[dict, None]:
         """User clicked '开始规划' — use the already-refined pending inference to plan."""
         inferred = self.manager.get_pending_inference(session_id) or {}
+        memory = self.manager.get_memory(session_id)
+        memory_facts = memory.get("session_facts", {})
+        memory_preferences = memory.get("derived_preferences", {})
 
-        # pending_inference is a session_facts dict (already updated by _run_refine_clarify)
-        # Wrap it back into confirm_preferences format to derive preferences
-        confirmed = await skills.confirm_preferences(inferred, "好的，就按这个来")
-        session_facts = confirmed.get("session_facts", {}) or inferred
-        preferences   = confirmed.get("preferences", {})
+        # Avoid re-confirming with a generic "好的" because that can erase concrete
+        # user demands. Planning uses the latest confirmed snapshot directly.
+        base_preferences = {
+            "food": inferred.get("food_preferences", []),
+            "venue": inferred.get("venue_preference"),
+            "skip_restaurant": inferred.get("skip_restaurant", False),
+        }
+        session_facts, preferences = skills.merge_confirmed_state(
+            inferred,
+            base_preferences,
+            memory_facts,
+            memory_preferences,
+            "",
+        )
 
         self.manager.update_memory(session_id, "session_facts", session_facts)
         self.manager.update_memory(session_id, "derived_preferences", preferences)
         self.manager.set_pending_inference(session_id, None)
-        self.manager.set_phase(session_id, "planning")
+        self._mark_planning_started(session_id)
 
-        start_msg = confirmed.get("start_message", "明白了，马上帮你规划！")
+        start_msg = skills.append_confirmed_requirements("明白了，马上帮你规划！", session_facts, preferences)
 
         self.manager.add_monitor_event(
             session_id, "main_agent",
@@ -240,18 +391,368 @@ class Orchestrator:
         yield _emit("profile_updated", facts=session_facts,
                     preferences=preferences, phase="monitoring")
 
+        handled, skip_msg = self._try_remove_restaurants_for_skip(
+            session_id, session_facts, preferences
+        )
+        if handled:
+            yield _emit("text", content=skip_msg)
+            yield _emit("itinerary_updated",
+                        nodes=self.manager.get_itinerary(session_id),
+                        facts=session_facts,
+                        preferences=preferences,
+                        phase="monitoring")
+            yield _emit("done")
+            return
+
+        handled, add_msg = await self._try_add_restaurant_when_requested(
+            session_id, message, session_facts, preferences
+        )
+        if handled:
+            yield _emit("text", content=add_msg)
+            yield _emit("itinerary_updated",
+                        nodes=self.manager.get_itinerary(session_id),
+                        facts=session_facts,
+                        preferences=preferences,
+                        phase="monitoring")
+            yield _emit("done")
+            return
+
+        handled, action_msg = self._try_apply_natural_language_node_action(
+            session_id, message
+        )
+        if handled:
+            yield _emit("text", content=action_msg)
+            yield _emit("itinerary_updated",
+                        nodes=self.manager.get_itinerary(session_id),
+                        facts=session_facts,
+                        preferences=preferences,
+                        phase="monitoring")
+            yield _emit("done")
+            return
+
+        handled, replace_msg = await self._try_replace_restaurant_by_food(
+            session_id, message, session_facts, preferences
+        )
+        if handled:
+            yield _emit("text", content=replace_msg)
+            yield _emit("itinerary_updated",
+                        nodes=self.manager.get_itinerary(session_id),
+                        facts=session_facts,
+                        preferences=preferences,
+                        phase="monitoring")
+            yield _emit("done")
+            return
+
         # Check if user wants to adjust something specific
         if any(w in message for w in ['重新规划', '换方案', '重规划']):
             yield _emit("text", content="好的，重新为你规划一个方案！")
+            self._mark_planning_started(session_id)
             async for evt in self._run_plan_core(session_id, session_facts, preferences):
                 yield evt
         else:
             # General response - just relay the message context
             yield _emit("text", content=f"已收到你的调整需求，正在为你处理：{message[:30]}...")
+            self._mark_planning_started(session_id)
             async for evt in self._run_plan_core(session_id, session_facts, preferences):
                 yield evt
 
     # ── Core: Plan ───────────────────────────────────────────────────
+
+    def _try_remove_restaurants_for_skip(self, session_id: str,
+                                         session_facts: dict,
+                                         preferences: dict) -> tuple[bool, str]:
+        """Remove restaurant nodes immediately when the user opts out of dining."""
+        if not (session_facts.get("skip_restaurant") or preferences.get("skip_restaurant")):
+            return False, ""
+        itinerary = self.manager.get_itinerary(session_id)
+        if not any(node.get("type") == "restaurant" or node.get("category") == "restaurant" for node in itinerary):
+            return False, ""
+        nodes = [
+            node for node in itinerary
+            if node.get("type") != "restaurant" and node.get("category") != "restaurant"
+        ]
+        self.manager.set_itinerary(session_id, nodes)
+        self.manager.add_monitor_event(
+            session_id, "main_agent",
+            "User opted out of restaurants; restaurant nodes removed",
+            "restaurant_removed",
+        )
+        return True, "好的，已按你的要求取消餐厅安排，当前行程不再包含餐厅。"
+
+    def _try_apply_natural_language_node_action(self, session_id: str,
+                                                message: str) -> tuple[bool, str]:
+        """Map user natural language to direct itinerary node actions."""
+        text = message or ""
+        delete_words = (
+            "删除", "去掉", "取消", "移除", "删掉",
+            "不去", "不要", "别去", "不安排", "去除",
+        )
+        if not any(word in text for word in delete_words):
+            return False, ""
+
+        itinerary = self.manager.get_itinerary(session_id)
+        if not itinerary:
+            return False, ""
+
+        target = self._find_node_from_message(itinerary, text)
+        if not target:
+            return False, ""
+
+        if target.get("completed_lock") or target.get("_checked"):
+            return True, f"「{target.get('name', '该地点')}」已经完成打卡，不能删除。"
+
+        if target.get("locked") or target.get("booking_status") == "confirmed":
+            return True, f"「{target.get('name', '该地点')}」已预约或锁定，涉及释放资源，请在行程卡片里确认取消。"
+
+        nodes = [node for node in itinerary if node.get("id") != target.get("id")]
+        self.manager.set_itinerary(session_id, nodes)
+        self.manager.add_monitor_event(
+            session_id, "main_agent",
+            f"Natural language node delete: {target.get('name')}",
+            "node_deleted",
+            target.get("poiId"),
+        )
+        return True, f"好的，已删除「{target.get('name', '该地点')}」。"
+
+    def _find_node_from_message(self, itinerary: list[dict], text: str) -> dict | None:
+        restaurant_words = ("餐厅", "吃饭", "用餐", "餐食", "午餐", "晚餐", "饭店", "饭馆")
+        activity_words = ("活动", "景点", "地点", "游玩", "公园", "商场", "展览", "桌游", "密室", "剧本杀")
+        light_words = ("轻活动", "收尾", "最后")
+
+        if any(word in text for word in restaurant_words):
+            return next((node for node in itinerary if node.get("type") == "restaurant" or node.get("category") == "restaurant"), None)
+
+        ordinal_map = {
+            "第一个": 0, "第一": 0, "1": 0,
+            "第二个": 1, "第二": 1, "2": 1,
+            "第三个": 2, "第三": 2, "3": 2,
+            "第四个": 3, "第四": 3, "4": 3,
+        }
+        for token, index in ordinal_map.items():
+            if token in text and index < len(itinerary):
+                if "活动" in text:
+                    activities = [node for node in itinerary if node.get("type") == "activity"]
+                    return activities[index] if index < len(activities) else None
+                return itinerary[index]
+
+        if any(word in text for word in light_words):
+            return next((node for node in reversed(itinerary) if node.get("type") == "light"), itinerary[-1])
+
+        for node in itinerary:
+            searchable = " ".join(
+                str(value)
+                for value in [
+                    node.get("name", ""),
+                    node.get("sub", ""),
+                    node.get("reason", ""),
+                    " ".join(node.get("tags", []) or []),
+                ]
+            )
+            if searchable and any(part and part in text for part in [node.get("name"), node.get("poiId")]):
+                return node
+            for tag in node.get("tags", []) or []:
+                if tag and tag in text:
+                    return node
+
+        if any(word in text for word in activity_words):
+            return next((node for node in itinerary if node.get("type") == "activity"), None)
+        return None
+
+    async def _try_replace_restaurant_by_food(self, session_id: str, message: str,
+                                              session_facts: dict,
+                                              preferences: dict) -> tuple[bool, str]:
+        """Replace the current restaurant directly when the user asks for a cuisine."""
+        detected = skills.detect_specific_preferences(message or "")
+        requested_food = detected.get("food") or []
+        if not requested_food:
+            return False, ""
+
+        itinerary = self.manager.get_itinerary(session_id)
+        target_index = next(
+            (
+                index for index, node in enumerate(itinerary)
+                if node.get("type") == "restaurant"
+                and not node.get("completed_lock")
+                and not node.get("_checked")
+            ),
+            None,
+        )
+        if target_index is None:
+            return False, ""
+
+        scenario = session_facts.get("scenario", "family")
+        candidates = await tools.get_restaurants(
+            scenario,
+            preferences=requested_food,
+            radius_km=20.0,
+        )
+        current_poi = itinerary[target_index].get("poiId")
+        candidates = [item for item in candidates if item.get("poi_id") != current_poi]
+        if not candidates:
+            food_text = "、".join(requested_food)
+            return False, f"我暂时没有找到可替换的{food_text}餐厅，继续为你重新规划。"
+
+        def food_match_count(item: dict) -> int:
+            searchable = " ".join(
+                str(value)
+                for value in [
+                    item.get("name", ""),
+                    item.get("cuisine", ""),
+                    " ".join(item.get("tags", []) or []),
+                    " ".join(item.get("menu_features", []) or []),
+                ]
+            )
+            return sum(1 for food in requested_food if food and food in searchable)
+
+        def score(item: dict) -> float:
+            queue_min = int(item.get("queue_min") or 0)
+            distance = float(item.get("distance_km") or 0)
+            rating = float(item.get("rating") or 4.0)
+            score_value = food_match_count(item) * 100
+            score_value += rating * 5
+            score_value -= distance * 1.5
+            score_value -= max(queue_min - 15, 0) * 0.4
+            if session_facts.get("has_children") and item.get("facilities", {}).get("child_seat"):
+                score_value += 8
+            return score_value
+
+        best = sorted(candidates, key=score, reverse=True)[0]
+        old_node = itinerary[target_index]
+        queue_min = int(best.get("queue_min") or 0)
+        tags = list(best.get("tags", []) or [])[:3] or [best.get("cuisine") or "餐厅"]
+        reason_bits = []
+        if food_match_count(best):
+            reason_bits.append("符合" + "、".join(requested_food))
+        if session_facts.get("has_children") and best.get("facilities", {}).get("child_seat"):
+            reason_bits.append("儿童椅")
+        if queue_min <= 15:
+            reason_bits.append("排队较短")
+
+        updated_node = {
+            **old_node,
+            "icon": "🍽️",
+            "name": best.get("name", old_node.get("name", "")),
+            "sub": best.get("address", old_node.get("sub", "")),
+            "distance": f"{float(best.get('distance_km') or 0):.1f}公里",
+            "queueMin": queue_min,
+            "queueText": f"约{queue_min}分钟" if queue_min > 0 else "无需排队",
+            "price": f"¥{best.get('avg_price', 80)}/位",
+            "rating": best.get("rating", old_node.get("rating", 4.5)),
+            "tags": tags,
+            "reason": "·".join(reason_bits)[:25] or (best.get("cuisine") or "匹配你的新口味"),
+            "poiId": best.get("poi_id", old_node.get("poiId")),
+            "booking_urgent": best.get("booking_required", False),
+        }
+        new_nodes = list(itinerary)
+        new_nodes[target_index] = updated_node
+        self.manager.set_itinerary(session_id, new_nodes)
+        self.manager.add_monitor_event(
+            session_id, "main_agent",
+            f"Restaurant replaced by cuisine request: {old_node.get('name')} -> {updated_node.get('name')}",
+            "restaurant_replaced",
+            updated_node.get("poiId"),
+        )
+        return True, f"已按{'、'.join(requested_food)}帮你把餐厅换成：{updated_node.get('name')}。"
+
+    async def _try_add_restaurant_when_requested(self, session_id: str, message: str,
+                                                 session_facts: dict,
+                                                 preferences: dict) -> tuple[bool, str]:
+        """Add a restaurant node when the user reverses a previous no-dining choice."""
+        detected = skills.detect_specific_preferences(message or "")
+        if not detected.get("wants_restaurant"):
+            return False, ""
+
+        itinerary = self.manager.get_itinerary(session_id)
+        if not itinerary:
+            return False, ""
+        if any(node.get("type") == "restaurant" or node.get("category") == "restaurant" for node in itinerary):
+            return False, ""
+
+        requested_food = (
+            detected.get("food")
+            or preferences.get("food")
+            or session_facts.get("food_preferences")
+            or []
+        )
+        scenario = session_facts.get("scenario", "family")
+        candidates = await tools.get_restaurants(
+            scenario,
+            preferences=requested_food or None,
+            radius_km=20.0,
+        )
+        if not candidates:
+            return False, "我理解你想加餐厅，但暂时没找到合适的餐厅候选，我会继续为你重新规划。"
+
+        def score(item: dict) -> float:
+            queue_min = int(item.get("queue_min") or 0)
+            distance = float(item.get("distance_km") or 0)
+            rating = float(item.get("rating") or 4.0)
+            value = rating * 10 - distance * 2 - max(queue_min - 15, 0) * 0.5
+            searchable = " ".join(
+                str(v)
+                for v in [
+                    item.get("name", ""),
+                    item.get("cuisine", ""),
+                    " ".join(item.get("tags", []) or []),
+                    " ".join(item.get("menu_features", []) or []),
+                ]
+            )
+            value += sum(25 for food in requested_food if food and food in searchable)
+            if session_facts.get("has_children") and item.get("facilities", {}).get("child_seat"):
+                value += 8
+            return value
+
+        best = sorted(candidates, key=score, reverse=True)[0]
+        prev = itinerary[-1]
+        start_min = self._parse_node_time(prev.get("endTime") or prev.get("end_time")) + 15
+        if start_min <= 15:
+            start_min = self._parse_node_time(session_facts.get("start_time", "14:00")) + 120
+        end_min = start_min + 75
+        queue_min = int(best.get("queue_min") or 0)
+        tags = list(best.get("tags", []) or [])[:3] or [best.get("cuisine") or "餐厅"]
+        restaurant_node = {
+            "id": f"node_{len(itinerary) + 1:03d}",
+            "poiId": best.get("poi_id"),
+            "type": "restaurant",
+            "category": "restaurant",
+            "icon": "🍽️",
+            "name": best.get("name", "附近餐厅"),
+            "sub": best.get("address", ""),
+            "address": best.get("address", ""),
+            "startTime": self._format_node_time(start_min),
+            "endTime": self._format_node_time(end_min),
+            "duration": 75,
+            "distance": f"{float(best.get('distance_km') or 0):.1f}公里",
+            "queueMin": queue_min,
+            "queueText": f"约{queue_min}分钟" if queue_min > 0 else "无需排队",
+            "price": f"¥{best.get('avg_price', 80)}/位",
+            "rating": best.get("rating", 4.5),
+            "tags": tags,
+            "reason": "按你的新需求补充餐厅",
+            "booking_required": best.get("booking_required", False),
+            "booking_urgent": best.get("booking_required", False),
+        }
+        self.manager.set_itinerary(session_id, [*itinerary, restaurant_node])
+        self.manager.add_monitor_event(
+            session_id, "main_agent",
+            f"Restaurant added by natural language request: {restaurant_node.get('name')}",
+            "restaurant_added",
+            restaurant_node.get("poiId"),
+        )
+        return True, f"可以，已按你的新想法加上餐厅：{restaurant_node.get('name')}。"
+
+    @staticmethod
+    def _parse_node_time(value: str | None) -> int:
+        try:
+            hour, minute = (value or "00:00").split(":")[:2]
+            return int(hour) * 60 + int(minute)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _format_node_time(total_minutes: int) -> str:
+        total_minutes = max(0, total_minutes)
+        return f"{(total_minutes // 60) % 24:02d}:{total_minutes % 60:02d}"
 
     async def _run_plan_core(self, session_id: str, session_facts: dict,
                              preferences: dict,
@@ -286,36 +787,58 @@ class Orchestrator:
         plan = None
         tool_call_count = 0
 
-        async for item in skills.run_agent_plan(sf_with_pinned, preferences):
-            t = item.get("_type", "")
+        try:
+            agent_stream = skills.run_agent_plan(sf_with_pinned, preferences)
+            while True:
+                try:
+                    item = await asyncio.wait_for(
+                        anext(agent_stream),
+                        timeout=PLANNING_STALE_SECONDS,
+                    )
+                except StopAsyncIteration:
+                    break
+                t = item.get("_type", "")
 
-            if t == "cot_step":
-                text = item["text"]
-                yield _emit("cot_step", text=text)
-                # Count tool calls for monitor log
-                if text.startswith("🔧"):
-                    tool_call_count += 1
-                await asyncio.sleep(0.05)
+                if t == "cot_step":
+                    text = item["text"]
+                    yield _emit("cot_step", text=text)
+                    # Count tool calls for monitor log
+                    if text.startswith("🔧"):
+                        tool_call_count += 1
+                    await asyncio.sleep(0.05)
 
-            elif t == "tool_error_limit":
-                if _retry < 1:
-                    yield _emit("cot_step", text="🔄 工具连续失败，自动重新规划中…")
-                    async for evt in self._run_plan_core(
-                        session_id, session_facts, preferences, _retry=1
-                    ):
-                        yield evt
-                else:
-                    yield _emit("error", message="工具调用持续失败，请检查 Mock API 是否正常运行后重试")
-                    yield _emit("done")
-                return
+                elif t == "tool_error_limit":
+                    if _retry < 1:
+                        yield _emit("cot_step", text="🔄 工具连续失败，自动重新规划中…")
+                        async for evt in self._run_plan_core(
+                            session_id, session_facts, preferences, _retry=1
+                        ):
+                            yield evt
+                    else:
+                        self._mark_planning_failed(session_id, "工具调用持续失败")
+                        yield _emit("error", message="工具调用持续失败，请检查 Mock API 是否正常运行后重试")
+                        yield _emit("done")
+                    return
 
-            elif t == "result":
-                plan = item["plan"]
-                yield _emit("status", id=2, status="done")
-                yield _emit("status", id=3, status="done")
-                yield _emit("status", id=4, status="done")
+                elif t == "result":
+                    plan = item["plan"]
+                    yield _emit("status", id=2, status="done")
+                    yield _emit("status", id=3, status="done")
+                    yield _emit("status", id=4, status="done")
+        except asyncio.TimeoutError:
+            self._mark_planning_failed(session_id, "Agent 规划超时")
+            yield _emit("error", message="Agent 规划超时了，已为你开放重新规划。请直接说「重新规划」或补充新的具体需求。")
+            yield _emit("done")
+            return
+        except Exception as exc:
+            logger.exception("Agent planning failed")
+            self._mark_planning_failed(session_id, str(exc))
+            yield _emit("error", message=f"Agent 规划中断：{exc}。已为你开放重新规划。")
+            yield _emit("done")
+            return
 
         if not plan:
+            self._mark_planning_failed(session_id, "Agent 未能生成行程")
             yield _emit("error", message="Agent 未能生成行程，请重试")
             yield _emit("done")
             return
@@ -333,6 +856,15 @@ class Orchestrator:
             yield _emit("done")
             return
 
+        if session_facts.get("skip_restaurant") or preferences.get("skip_restaurant"):
+            before = len(nodes)
+            nodes = [
+                node for node in nodes
+                if node.get("type") != "restaurant" and node.get("category") != "restaurant"
+            ]
+            if before != len(nodes):
+                yield _emit("cot_step", text=f"⚠️ 已按用户要求移除 {before - len(nodes)} 个餐厅节点")
+
         # ── Consecutive restaurant check ─────────────────────────────
         def _is_restaurant(node: dict) -> bool:
             return (node.get("type") == "restaurant"
@@ -345,8 +877,14 @@ class Orchestrator:
         if consecutive_rest:
             yield _emit("cot_step", text="⚠️ 检测到连续两个餐厅节点，已记录警告（LLM 规划应避免此情况）")
 
-        # ── Feasibility check (from teammate's validation logic) ──────
-        risks = skills.validate_feasibility(nodes, session_facts)
+        # ── Feasibility + output validation ───────────────────────────
+        legacy_risks = skills.validate_feasibility(nodes, session_facts)
+        validation = validate_itinerary_nodes(nodes, session_facts, preferences)
+        risks = []
+        for risk in [*legacy_risks, *validation.issues]:
+            if risk not in risks:
+                risks.append(risk)
+
         if risks:
             for r in risks:
                 yield _emit("cot_step", text=f"⚠️ 合理性警告：{r}")
@@ -355,7 +893,7 @@ class Orchestrator:
                 f"合理性检查：{'; '.join(risks[:2])}", "feasibility_warning"
             )
         else:
-            yield _emit("cot_step", text="✅ 合理性自检通过：通勤比例/时间无重叠/结束时间均合格")
+            yield _emit("cot_step", text="✅ 合理性自检通过：结构/偏好/通勤/时间均合格")
 
         # Add transit to first node (from home/departure point to first POI)
         if nodes:
@@ -427,6 +965,7 @@ class Orchestrator:
             )
 
         self.manager.set_itinerary(session_id, nodes)
+        self._clear_planning_started(session_id)
         self.manager.set_phase(session_id, "monitoring")
 
         self.manager.add_monitor_event(
@@ -513,9 +1052,26 @@ class Orchestrator:
                     s.setdefault("booking_warned", []).append(node.get("poiId"))
 
         for i, node in enumerate(itinerary):
-            await asyncio.sleep(0.9 + i * 0.15)
             done_text = _done_label(node)
             voucher = _voucher_code() if node["type"] != "light" else None
+
+            self.manager.update_node(session_id, node["id"], {"booking_status": "queued"})
+            yield _emit("fulfill_item", id=node["id"], status="loading", action="已进入履约队列...")
+            await asyncio.sleep(0.2)
+
+            self.manager.update_node(session_id, node["id"], {"booking_status": "processing"})
+            yield _emit("fulfill_item", id=node["id"], status="loading", action="正在确认资源...")
+
+            booking_result = await tools.booking_execute(node)
+            if booking_result.get("status") == "failed":
+                self.manager.update_node(session_id, node["id"], {"booking_status": "failed"})
+                yield _emit("fulfill_item", id=node["id"], status="done", action="履约失败，请稍后重试")
+                continue
+
+            self.manager.update_node(session_id, node["id"], {
+                "booking_status": "confirmed",
+                "booking_ref": booking_result.get("booking_ref"),
+            })
             self.manager.lock_node(session_id, node["id"])
             yield _emit("fulfill_item",
                         id=node["id"],
@@ -548,6 +1104,14 @@ class Orchestrator:
             session_id, "main_agent",
             "履约完成，开始后台监控排队和天气...", "monitoring_start"
         )
+        watch_configs = build_watch_configs_for_itinerary(self.manager.get_itinerary(session_id))
+        if watch_configs:
+            await self.background_watch.stop_all(session_id)
+            await self.background_watch.start_watch_group(session_id, watch_configs)
+            self.manager.add_monitor_event(
+                session_id, "background_watch",
+                f"已启动 {len(watch_configs)} 个后台监控任务", "watch_started"
+            )
 
         # Check initial queue status for restaurants
         await asyncio.sleep(0.5)
@@ -580,6 +1144,30 @@ class Orchestrator:
         exception_type = data.get("exception_type", "queue_spike")
         recommended    = data.get("recommended", {})
         original_node_id = data.get("original_node_id")
+        confirmed = bool(data.get("confirmed", True))
+        request_id = data.get("request_id")
+
+        if not request_id:
+            pending = self.confirmation_gateway.find_latest_pending(session_id, "replan")
+            request_id = pending.get("request_id") if pending else None
+
+        if request_id:
+            await self.confirmation_gateway.resolve(
+                session_id,
+                request_id,
+                confirmed,
+                {"exception_type": exception_type, "recommended": recommended},
+            )
+
+        if not confirmed:
+            self.manager.clear_exception(session_id)
+            self.manager.add_monitor_event(
+                session_id, "main_agent",
+                "用户选择保留原方案，异常确认已关闭", "replan_rejected"
+            )
+            yield _emit("text", content="好的，已保留原方案。我会继续监控，有变化再提醒你。")
+            yield _emit("done")
+            return
 
         itinerary = self.manager.get_itinerary(session_id)
 
@@ -798,8 +1386,56 @@ class Orchestrator:
             "node_checkin", node_id,
         )
 
+        if total and done_count == total:
+            await self.background_watch.stop_all(session_id)
+            self.manager.add_monitor_event(
+                session_id, "background_watch",
+                "行程已全部完成，后台监控已停止", "watch_stopped"
+            )
+
         return {"nodes": updated, "next_node": next_node,
                 "message": msg, "done_count": done_count, "total": total}
+
+    async def stop_background_watch(self, session_id: str) -> None:
+        await self.background_watch.stop_all(session_id)
+
+    async def cancel_confirmations(self, session_id: str) -> None:
+        await self.confirmation_gateway.cancel_session(session_id)
+
+    def _mark_planning_started(self, session_id: str) -> None:
+        session = self.manager.get(session_id)
+        if session is not None:
+            session["planning_started_at"] = time.time()
+            session["planning_error"] = None
+        self.manager.set_phase(session_id, "planning")
+
+    def _clear_planning_started(self, session_id: str) -> None:
+        session = self.manager.get(session_id)
+        if session is not None:
+            session["planning_started_at"] = None
+            session["planning_error"] = None
+
+    def _mark_planning_failed(self, session_id: str, reason: str) -> None:
+        session = self.manager.get(session_id)
+        if session is not None:
+            session["planning_error"] = reason
+            session["planning_started_at"] = None
+        self.manager.set_phase(session_id, "needs_replan")
+        self.manager.add_monitor_event(
+            session_id,
+            "main_agent",
+            f"规划失败/超时: {reason}",
+            "planning_failed",
+        )
+
+    def _planning_is_stale(self, session: dict) -> bool:
+        started = session.get("planning_started_at")
+        if started:
+            return time.time() - float(started) > PLANNING_STALE_SECONDS
+        return session.get("phase") == "planning"
+
+    def _message_requests_replan(self, message: str) -> bool:
+        return any(word in message for word in (*REPLAN_WORDS, *STUCK_WORDS))
 
     # ── Flow 7: Simulator Inject (natural language → event) ─────────
 
@@ -917,4 +1553,3 @@ def _done_label(node: dict) -> str:
     if node.get("booking_required") or node.get("booking_urgent"):
         return "预约成功"
     return "已加入行程"
-

@@ -125,7 +125,7 @@ function FulfillBubble({ items, progress }) {
 }
 
 // ── Exception card ────────────────────────────────────────────────
-function ExceptionCard({ data, onConfirm }) {
+function ExceptionCard({ data, onConfirm, onDismiss }) {
   const [done, setDone] = useState(false)
   const isWeather = data.exception_type === 'weather_heavy_rain'
   const alt = data.alternative || {}
@@ -169,7 +169,7 @@ function ExceptionCard({ data, onConfirm }) {
           <button className="btn-confirm-sm" onClick={() => { setDone(true); onConfirm(data) }}>
             同意切换
           </button>
-          <button className="btn-dismiss-sm" onClick={() => setDone(true)}>
+          <button className="btn-dismiss-sm" onClick={() => { setDone(true); onDismiss?.(data) }}>
             暂不处理
           </button>
         </div>
@@ -234,7 +234,7 @@ function BookingReminderCard({ content, name }) {
 }
 
 // ── Soft-lock confirm card ────────────────────────────────────────
-function SoftLockConfirmCard({ nodeId, action, reason, onConfirm, onDismiss }) {
+function SoftLockConfirmCard({ nodeId, action, reason, requestId, onConfirm, onDismiss }) {
   const [done, setDone] = useState(false)
   if (done) return null
   const actionLabel = action === 'delete' ? '确认取消预约' : '确认替换'
@@ -246,11 +246,11 @@ function SoftLockConfirmCard({ nodeId, action, reason, onConfirm, onDismiss }) {
         <div className="exception-actions">
           <button
             className="btn-danger-sm"
-            onClick={() => { setDone(true); onConfirm(nodeId, action) }}
+            onClick={() => { setDone(true); onConfirm(nodeId, action, requestId) }}
           >
             {actionLabel}
           </button>
-          <button className="btn-dismiss-sm" onClick={() => { setDone(true); onDismiss() }}>
+          <button className="btn-dismiss-sm" onClick={() => { setDone(true); onDismiss?.(nodeId, action, requestId) }}>
             保留，我再想想
           </button>
         </div>
@@ -317,7 +317,7 @@ function MonitorAlertBubble({ content, severity }) {
 }
 
 // ── Main dispatcher ───────────────────────────────────────────────
-export default function ChatMessage({ msg, onNodeAction, onTransitChange, onExceptionConfirm, onReportSelect, onSoftLockConfirm }) {
+export default function ChatMessage({ msg, onNodeAction, onTransitChange, onExceptionConfirm, onExceptionDismiss, onReportSelect, onSoftLockConfirm, onSoftLockDismiss }) {
   if (msg.role === 'user') return <UserBubble content={msg.content} />
 
   switch (msg.type) {
@@ -340,12 +340,13 @@ export default function ChatMessage({ msg, onNodeAction, onTransitChange, onExce
         nodeId={msg.node_id}
         action={msg.action}
         reason={msg.reason}
+        requestId={msg.request_id}
         onConfirm={onSoftLockConfirm}
-        onDismiss={() => {}}
+        onDismiss={onSoftLockDismiss}
       />
     )
     case 'fulfill':          return <FulfillBubble items={msg.items} progress={msg.progress} />
-    case 'exception':        return <ExceptionCard data={msg.data} onConfirm={onExceptionConfirm} />
+    case 'exception':        return <ExceptionCard data={msg.data} onConfirm={onExceptionConfirm} onDismiss={onExceptionDismiss} />
     case 'report':           return <ReportBubble prompt={msg.prompt} onSelect={onReportSelect} />
     case 'booking_reminder':  return <BookingReminderCard content={msg.content} name={msg.name} />
     case 'monitor_alert':     return <MonitorAlertBubble content={msg.content} severity={msg.severity} />

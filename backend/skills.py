@@ -27,7 +27,7 @@ _ACTIVITY_KEYWORDS = [
     ("mall", ["商场", "购物中心", "逛街", "购物", "mall", "Mall"]),
     ("exhibition", ["展览", "美术馆", "博物馆", "科技馆", "画展"]),
     ("citywalk", ["citywalk", "Citywalk", "街区", "老街", "步行街"]),
-    ("social", ["剧本杀", "密室", "桌游", "桌游吧"]),
+    ("social", ["剧本杀", "密室", "桌游", "桌游吧", "社交场合", "社交活动", "互动", "一起玩", "聚会活动"]),
     ("playground", ["亲子乐园", "游乐园", "儿童乐园", "乐园"]),
 ]
 
@@ -51,9 +51,25 @@ _ACTIVITY_TO_VENUE = {
     "park": "outdoor",
     "mall": "mall",
     "exhibition": "indoor",
+    "citywalk": "outdoor",
     "social": "indoor",
     "playground": "indoor",
 }
+
+_PARTICIPANT_LABELS = {
+    "self": "我的偏好",
+    "spouse": "配偶偏好",
+    "child": "孩子偏好",
+    "friends": "朋友偏好",
+}
+
+_OWNER_ALIASES = {
+    "spouse": ["老婆", "妻子", "媳妇", "太太", "夫人", "女朋友", "女友", "对象", "伴侣", "另一半", "她"],
+    "self": ["我", "自己", "本人", "我的"],
+}
+
+_SELF_MARKERS = ("我是男", "我是女", "我男", "我女", "本人男", "本人女", "我是个男", "我是个女")
+_CHILD_MARKERS = ("孩子", "娃", "小朋友", "宝贝", "儿子", "女儿", "儿童")
 
 
 def _append_unique(items: list, values: list) -> list:
@@ -64,8 +80,189 @@ def _append_unique(items: list, values: list) -> list:
     return result
 
 
-def detect_specific_preferences(message: str) -> dict:
+def _parse_hhmm_minutes(value: str) -> Optional[int]:
+    try:
+        text = str(value).strip()
+        day_offset = 0
+        if text.startswith("次日"):
+            day_offset = 24 * 60
+            text = text.replace("次日", "", 1).strip()
+        h, m = map(int, text.split(":"))
+        return day_offset + h * 60 + m
+    except Exception:
+        return None
+
+
+def _fmt_hhmm(total_minutes: int) -> str:
+    total_minutes = max(0, int(total_minutes))
+    day = total_minutes // (24 * 60)
+    minute_of_day = total_minutes % (24 * 60)
+    text = f"{minute_of_day // 60:02d}:{minute_of_day % 60:02d}"
+    return f"次日 {text}" if day == 1 else (f"第{day + 1}天 {text}" if day > 1 else text)
+
+
+def _add_minutes(total_minutes: int, delta: int) -> int:
+    return max(0, int(total_minutes) + int(delta))
+
+
+def _clamp_nodes_to_day(nodes: list[dict]) -> list[dict]:
+    cleaned = []
+    previous_end = -1
+    for node in nodes or []:
+        item = dict(node)
+        start_raw = item.get("timeStart") or item.get("startTime")
+        end_raw = item.get("timeEnd") or item.get("endTime")
+        start_min = _parse_hhmm_minutes(start_raw)
+        end_min = _parse_hhmm_minutes(end_raw)
+        if start_min is not None:
+            start_min = max(previous_end, start_min)
+            item["timeStart"] = _fmt_hhmm(start_min)
+        if end_min is not None:
+            if start_min is not None:
+                end_min = max(start_min, end_min)
+            item["timeEnd"] = _fmt_hhmm(end_min)
+            previous_end = max(previous_end, end_min)
+        cleaned.append(item)
+    return cleaned
+
+
+_CN_NUM_MAP = {
+    "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
+
+
+def _parse_cn_number(value: str) -> Optional[int]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    if text in _CN_NUM_MAP:
+        return _CN_NUM_MAP[text]
+    if text.startswith("十") and len(text) == 2:
+        tail = _CN_NUM_MAP.get(text[1])
+        return 10 + tail if tail is not None else None
+    if text.endswith("十") and len(text) == 2:
+        head = _CN_NUM_MAP.get(text[0])
+        return head * 10 if head is not None else None
+    if "十" in text and len(text) == 3:
+        head = _CN_NUM_MAP.get(text[0])
+        tail = _CN_NUM_MAP.get(text[2])
+        return head * 10 + tail if head is not None and tail is not None else None
+    return None
+
+
+def _format_start_time(minutes: int) -> str:
+    minutes = max(0, int(minutes))
+    day = minutes // (24 * 60)
+    minute_of_day = minutes % (24 * 60)
+    hhmm = f"{minute_of_day // 60:02d}:{minute_of_day % 60:02d}"
+    return f"次日 {hhmm}" if day == 1 else hhmm
+
+
+def _normalize_start_time_for_math(value: str, fallback: str = "14:00") -> int:
+    parsed = _parse_hhmm_minutes(value)
+    if parsed is not None:
+        return parsed
+    parsed = _parse_hhmm_minutes(fallback)
+    return parsed if parsed is not None else 14 * 60
+
+
+def parse_time_and_duration_updates(message: str,
+                                    previous_facts: dict | None = None) -> dict:
+    """Extract explicit monitoring-stage schedule edits from natural language."""
+    text = message or ""
+    previous_facts = previous_facts or {}
+    updates: dict = {}
+
+    time_pattern = re.compile(
+        r"(上午|早上|下午|晚上|傍晚|中午|凌晨)?\s*([0-9]{1,2}|[一二两三四五六七八九十]{1,3})\s*[点时:：]\s*([0-9]{1,2})?"
+    )
+    match = time_pattern.search(text)
+    relative_point_words = (
+        "晚一点", "晚点", "早一点", "早点", "长一点", "长时间一点",
+        "久一点", "短一点", "快一点",
+    )
+    if match:
+        period, hour_raw, minute_raw = match.groups()
+    explicit_time_context = bool(
+        match
+        and (
+            period
+            or str(hour_raw).isdigit()
+            or any(w in text for w in ["出发", "开始", "改到", "改成", "改为", "换到", "时间到", "到", "定在", "约在", "几点"])
+        )
+        and not (
+            not period
+            and str(hour_raw) in ("一", "1")
+            and any(w in text for w in relative_point_words)
+        )
+    )
+    if match and explicit_time_context:
+        hour = _parse_cn_number(hour_raw)
+        if hour is not None:
+            minute = int(minute_raw) if minute_raw else 0
+            if period in ("下午", "晚上", "傍晚") and hour < 12:
+                hour += 12
+            elif period == "中午" and hour < 11:
+                hour += 12
+            elif period == "凌晨" and hour == 12:
+                hour = 0
+            elif not period and 1 <= hour < 8:
+                hour += 12
+            updates["start_time"] = _format_start_time(hour * 60 + minute)
+
+    current_start = _normalize_start_time_for_math(previous_facts.get("start_time"))
+    if "start_time" not in updates:
+        if any(w in text for w in ["晚一点", "晚点", "往后", "推迟", "延后"]):
+            updates["start_time"] = _format_start_time(current_start + 60)
+        elif any(w in text for w in ["早一点", "早点", "提前", "往前"]):
+            updates["start_time"] = _format_start_time(current_start - 60)
+
+    duration_match = re.search(
+        r"([0-9]+|[一二两三四五六七八九十]{1,3})\s*(个)?\s*小时", text
+    )
+    if duration_match and any(w in text for w in ["时长", "时间", "玩", "逛", "改", "换", "长", "久"]):
+        hours = _parse_cn_number(duration_match.group(1))
+        if hours is not None:
+            updates["duration_hours"] = max(1, min(12, hours))
+    elif any(w in text for w in ["长时间", "久一点", "玩久", "多玩", "逛久", "时间长一点"]):
+        current_duration = float(previous_facts.get("duration_hours") or 3)
+        updates["duration_hours"] = max(1, min(12, current_duration + 1))
+    elif any(w in text for w in ["短一点", "少玩", "快一点", "时间短一点"]):
+        current_duration = float(previous_facts.get("duration_hours") or 3)
+        updates["duration_hours"] = max(1, min(12, current_duration - 1))
+
+    return updates
+
+
+def _default_start_time_from_current(current_time: str) -> str:
+    current_min = _normalize_start_time_for_math(current_time, "14:00")
+    target = current_min + 60
+    remainder = target % 30
+    if remainder:
+        target += 30 - remainder
+    return _format_start_time(target)
+
+
+def _detect_specific_preferences_core(message: str) -> dict:
     """Detect concrete food/activity preferences from user text."""
+    skip_restaurant = any(w in message for w in [
+        "吃过饭", "吃过了", "已经吃了", "刚吃完", "吃完饭了",
+        "不吃", "不吃了", "不吃饭", "不想吃饭", "不用吃饭", "不需要吃饭", "不用餐", "不需要餐厅",
+        "不去吃饭", "不外出吃饭", "不在外面吃饭", "不出去吃饭",
+        "不去餐厅", "不要餐厅", "别去餐厅", "餐厅去掉", "去掉餐厅",
+        "取消餐厅", "删除餐厅", "移除餐厅", "不安排餐厅",
+        "不安排餐", "别安排餐", "不安排吃饭", "回家吃", "自己吃", "自己解决",
+        "带饭了", "只玩", "只安排活动",
+    ])
+    wants_restaurant = any(w in message for w in [
+        "反悔要去餐厅", "反悔去餐厅", "反悔吃饭", "还是去餐厅", "还是吃饭",
+        "想去餐厅", "要去餐厅", "加个餐厅", "加一家餐厅", "安排餐厅",
+        "安排吃饭", "想吃饭", "要吃饭", "去吃饭", "吃个饭", "外面吃",
+    ]) and not skip_restaurant
+
     food = []
     for keyword in _FOOD_KEYWORDS:
         if keyword in message:
@@ -95,7 +292,108 @@ def detect_specific_preferences(message: str) -> dict:
         "activity_preference_label": _ACTIVITY_LABELS.get(activity),
         "venue": venue,
         "friends_activity_type": _ACTIVITY_TO_FRIENDS_TYPE.get(activity),
+        "skip_restaurant": skip_restaurant,
+        "wants_restaurant": wants_restaurant,
     }
+
+
+def _compact_preference(detected: dict) -> dict:
+    pref = {}
+    for key in ("venue", "activity_preference", "activity_preference_label", "friends_activity_type"):
+        if detected.get(key):
+            pref[key] = detected[key]
+    if detected.get("food"):
+        pref["food"] = list(detected["food"])
+    return pref
+
+
+def _apply_preference_priority(facts: dict, requested_owner: str, hard_pref: dict) -> None:
+    hard = dict(hard_pref or {})
+    if hard:
+        facts["hard_constraints"] = {
+            "owner": requested_owner,
+            "preference": hard,
+        }
+    participant_preferences = facts.get("participant_preferences") or {}
+    soft = {
+        owner: pref
+        for owner, pref in participant_preferences.items()
+        if owner != requested_owner and pref
+    }
+    if soft:
+        facts["soft_preferences"] = soft
+
+
+def detect_participant_preferences(message: str) -> dict:
+    """Capture owner-specific preferences, e.g. spouse likes malls, user likes parks."""
+    text = message or ""
+    result = {}
+    fragments = [p.strip() for p in re.split(r"[，,。；;\n]", text) if p.strip()]
+    for fragment in fragments:
+        owner = None
+        # Spouse markers must win over a generic "我" in phrases like "我老婆".
+        for alias in _OWNER_ALIASES["spouse"]:
+            if alias in fragment:
+                owner = "spouse"
+                break
+        if not owner:
+            for alias in _OWNER_ALIASES["self"]:
+                if alias in fragment:
+                    owner = "self"
+                    break
+        if not owner:
+            continue
+        detected = _compact_preference(_detect_specific_preferences_core(fragment))
+        if detected:
+            result.setdefault(owner, {}).update(detected)
+    return result
+
+
+def _requested_preference_owner(message: str) -> Optional[str]:
+    text = message or ""
+    spouse_words = ("老婆", "妻子", "媳妇", "太太", "夫人", "女朋友", "女友", "对象", "伴侣", "另一半", "她")
+    self_words = ("我", "我的", "自己", "本人")
+    child_words = ("孩子", "小朋友", "娃", "宝贝", "儿童")
+    friends_words = ("朋友", "哥们", "闺蜜", "同事", "同学")
+    if any(re.search(rf"(按|按照|听|以|根据|优先).{{0,8}}{re.escape(word)}", text) for word in spouse_words):
+        return "spouse"
+    if any(re.search(rf"{re.escape(word)}.{{0,8}}(喜好|偏好|想法|为准|来)", text) for word in spouse_words):
+        return "spouse"
+    if "按她的" in text or "她喜欢的" in text:
+        return "spouse"
+    if any(re.search(rf"(按|按照|听|以|根据|优先).{{0,8}}{re.escape(word)}", text) for word in self_words):
+        return "self"
+    if any(re.search(rf"{re.escape(word)}.{{0,8}}(喜好|偏好|想法|为准|来)", text) for word in self_words):
+        return "self"
+    if any(re.search(rf"(按|按照|听|以|根据|优先).{{0,8}}{re.escape(word)}", text) for word in child_words):
+        return "child"
+    if any(re.search(rf"(以|按|按照).{{0,8}}{re.escape(word)}.{{0,6}}(为主|优先|为准)", text) for word in friends_words):
+        return "friends"
+    return None
+
+
+def _has_owner_conflict(participant_preferences: dict) -> bool:
+    if len(participant_preferences or {}) < 2:
+        return False
+    venues = {
+        pref.get("venue")
+        for pref in participant_preferences.values()
+        if isinstance(pref, dict) and pref.get("venue")
+    }
+    activities = {
+        pref.get("activity_preference")
+        for pref in participant_preferences.values()
+        if isinstance(pref, dict) and pref.get("activity_preference")
+    }
+    return len(venues) > 1 or len(activities) > 1
+
+
+def detect_specific_preferences(message: str) -> dict:
+    """Detect concrete preferences from user text, including owner-specific ones."""
+    detected = _detect_specific_preferences_core(message or "")
+    detected["participant_preferences"] = detect_participant_preferences(message or "")
+    detected["requested_preference_owner"] = _requested_preference_owner(message or "")
+    return detected
 
 
 def merge_specific_preferences(session_facts: dict, preferences: dict, message: str) -> tuple[dict, dict]:
@@ -103,23 +401,353 @@ def merge_specific_preferences(session_facts: dict, preferences: dict, message: 
     facts = dict(session_facts or {})
     prefs = dict(preferences or {})
     detected = detect_specific_preferences(message or "")
+    schedule_updates = parse_time_and_duration_updates(message or "", facts)
+    if schedule_updates:
+        facts.update(schedule_updates)
+    participant_preferences = dict(facts.get("participant_preferences") or {})
+    for owner, owner_pref in (detected.get("participant_preferences") or {}).items():
+        participant_preferences[owner] = {
+            **dict(participant_preferences.get(owner) or {}),
+            **dict(owner_pref or {}),
+        }
+    if participant_preferences:
+        facts["participant_preferences"] = participant_preferences
+
+    requested_owner = detected.get("requested_preference_owner")
+    if requested_owner and participant_preferences.get(requested_owner):
+        owner_pref = participant_preferences[requested_owner]
+        facts["preference_basis"] = requested_owner
+        if owner_pref.get("food"):
+            prefs["food"] = _append_unique(prefs.get("food", []), owner_pref["food"])
+            facts["food_preferences"] = _append_unique(facts.get("food_preferences", []), owner_pref["food"])
+        if owner_pref.get("venue"):
+            prefs["venue"] = owner_pref["venue"]
+            facts["venue_preference"] = owner_pref["venue"]
+        if owner_pref.get("activity_preference"):
+            facts["activity_preference"] = owner_pref["activity_preference"]
+            facts["activity_preference_label"] = owner_pref.get("activity_preference_label")
+            if owner_pref.get("friends_activity_type"):
+                facts["friends_activity_type"] = owner_pref["friends_activity_type"]
+            else:
+                facts.pop("friends_activity_type", None)
+        _apply_preference_priority(facts, requested_owner, owner_pref)
+        facts.pop("preference_conflict", None)
+    elif requested_owner:
+        hard_pref = _compact_preference(detected)
+        if hard_pref:
+            facts["preference_basis"] = requested_owner
+            if hard_pref.get("food"):
+                prefs["food"] = _append_unique(prefs.get("food", []), hard_pref["food"])
+                facts["food_preferences"] = _append_unique(facts.get("food_preferences", []), hard_pref["food"])
+            if hard_pref.get("venue"):
+                prefs["venue"] = hard_pref["venue"]
+                facts["venue_preference"] = hard_pref["venue"]
+            if hard_pref.get("activity_preference"):
+                facts["activity_preference"] = hard_pref["activity_preference"]
+                facts["activity_preference_label"] = hard_pref.get("activity_preference_label")
+                if hard_pref.get("friends_activity_type"):
+                    facts["friends_activity_type"] = hard_pref["friends_activity_type"]
+            _apply_preference_priority(facts, requested_owner, hard_pref)
+            facts.pop("preference_conflict", None)
+
+    owner_conflict = _has_owner_conflict(detected.get("participant_preferences") or {})
+    if owner_conflict and not requested_owner:
+        facts["preference_conflict"] = "participant_preferences"
+        prefs.pop("venue", None)
+        facts.pop("venue_preference", None)
+        facts.pop("activity_preference", None)
+        facts.pop("activity_preference_label", None)
+        facts.pop("friends_activity_type", None)
 
     if detected["food"]:
         replace_food = any(w in (message or "") for w in ["换成", "改成", "改为", "不要", "别吃"])
         prefs["food"] = list(detected["food"]) if replace_food else _append_unique(prefs.get("food", []), detected["food"])
         facts["food_preferences"] = list(detected["food"]) if replace_food else _append_unique(facts.get("food_preferences", []), detected["food"])
 
-    if detected["venue"]:
+    if detected["venue"] and not owner_conflict and not requested_owner:
         prefs["venue"] = detected["venue"]
         facts["venue_preference"] = detected["venue"]
 
-    if detected["activity_preference"]:
+    if detected["activity_preference"] and not owner_conflict and not requested_owner:
         facts["activity_preference"] = detected["activity_preference"]
         facts["activity_preference_label"] = detected["activity_preference_label"]
         if detected["friends_activity_type"]:
             facts["friends_activity_type"] = detected["friends_activity_type"]
 
+    if detected.get("skip_restaurant"):
+        facts["skip_restaurant"] = True
+        prefs["skip_restaurant"] = True
+        prefs["food"] = []
+        facts["food_preferences"] = []
+    elif detected.get("wants_restaurant"):
+        facts["skip_restaurant"] = False
+        prefs["skip_restaurant"] = False
+
     return facts, prefs
+
+
+def _has_value(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    return True
+
+
+def _merge_lists(base: list, incoming: list) -> list:
+    return _append_unique(list(base or []), list(incoming or []))
+
+
+def _explicit_negative_update(message: str) -> bool:
+    return any(w in (message or "") for w in [
+        "不是", "没有", "不用", "不需要", "不要", "别", "取消",
+        "不想", "无所谓", "都可以", "不限",
+    ])
+
+
+def _self_gender_explicit(message: str) -> bool:
+    return any(marker in (message or "") for marker in _SELF_MARKERS)
+
+
+def _sanitize_identity_fields(facts: dict, user_message: str = "") -> dict:
+    """Remove the user from companions/gender counts unless self gender is explicit."""
+    clean = dict(facts or {})
+    self_values = {"self", "user", "me", "我", "自己", "本人"}
+    companions = clean.get("companions")
+    if isinstance(companions, list):
+        clean["companions"] = [c for c in companions if c not in self_values]
+    else:
+        clean["companions"] = []
+
+    msg = user_message or ""
+    if any(w in msg for w in _OWNER_ALIASES["spouse"]) and "spouse" not in clean["companions"]:
+        clean["companions"].append("spouse")
+
+    child_mentioned = any(w in msg for w in _CHILD_MARKERS)
+    if child_mentioned:
+        clean["child_confirmed_by_user"] = True
+        if "child" not in clean["companions"]:
+            clean["companions"].append("child")
+    elif clean.get("has_children") and not clean.get("child_confirmed_by_user"):
+        clean["has_children"] = False
+        clean["child_age"] = None
+        clean["child_purpose"] = None
+        clean["companions"] = [c for c in clean["companions"] if c != "child"]
+
+    desc = str(clean.get("companions_desc") or "").strip()
+    if desc:
+        for token in ("你+", "我+", "用户+", "本人+", "自己+", "你和", "我和", "用户和", "本人和", "自己和"):
+            desc = desc.replace(token, "")
+        if not child_mentioned and not clean.get("child_confirmed_by_user"):
+            for token in ("+孩子", "孩子+", "和孩子", "带孩子", "孩子"):
+                desc = desc.replace(token, "")
+        desc = desc.strip("+、，, 和")
+        clean["companions_desc"] = desc
+
+    if _self_gender_explicit(msg):
+        return clean
+
+    female_other_markers = ("老婆", "妻子", "媳妇", "太太", "夫人", "女朋友", "女友", "妈妈", "母亲", "女儿", "姐妹", "女生", "女孩")
+    male_other_markers = ("老公", "丈夫", "男朋友", "男友", "爸爸", "父亲", "儿子", "兄弟", "哥们", "男生", "男孩")
+    has_female_other = any(w in msg for w in female_other_markers) or "spouse" in (clean.get("companions") or [])
+    has_male_other = any(w in msg for w in male_other_markers)
+
+    male_count = int(clean.get("male_count") or 0)
+    female_count = int(clean.get("female_count") or 0)
+    if has_female_other and female_count == 0:
+        female_count = 1
+    if male_count and not has_male_other:
+        male_count = 0
+    clean["male_count"] = male_count
+    clean["female_count"] = female_count
+    clean["group_gender"] = "unknown"
+    return clean
+
+
+def merge_confirmed_state(previous_facts: dict,
+                          previous_preferences: dict,
+                          new_facts: dict,
+                          new_preferences: dict,
+                          user_message: str = "") -> tuple[dict, dict]:
+    """
+    Merge clarification/confirmation output without erasing explicit demands.
+
+    The LLM often returns a complete schema with default false/null/empty values.
+    During confirmation, those defaults must not wipe user-stated needs that were
+    already captured from earlier turns.
+    """
+    facts = dict(previous_facts or {})
+    prefs = dict(previous_preferences or {})
+
+    for key, value in (new_facts or {}).items():
+        if isinstance(value, list):
+            facts[key] = _merge_lists(facts.get(key, []), value)
+        elif isinstance(value, bool) and facts.get(key) is True and value is False and not _explicit_negative_update(user_message):
+            continue
+        elif _has_value(value):
+            facts[key] = value
+        elif key not in facts:
+            facts[key] = value
+
+    for key, value in (new_preferences or {}).items():
+        if isinstance(value, list):
+            prefs[key] = _merge_lists(prefs.get(key, []), value)
+        elif isinstance(value, bool) and prefs.get(key) is True and value is False and not _explicit_negative_update(user_message):
+            continue
+        elif _has_value(value):
+            prefs[key] = value
+        elif key not in prefs:
+            prefs[key] = value
+
+    # Keep the two representations in sync for planner + profile panel.
+    if facts.get("food_preferences"):
+        prefs["food"] = _merge_lists(prefs.get("food", []), facts.get("food_preferences", []))
+    if prefs.get("food"):
+        facts["food_preferences"] = _merge_lists(facts.get("food_preferences", []), prefs.get("food", []))
+
+    if facts.get("venue_preference") and not prefs.get("venue"):
+        prefs["venue"] = facts.get("venue_preference")
+    if prefs.get("venue") and not facts.get("venue_preference"):
+        facts["venue_preference"] = prefs.get("venue")
+
+    facts, prefs = merge_specific_preferences(facts, prefs, user_message or "")
+    facts = _sanitize_identity_fields(facts, user_message or "")
+    return facts, prefs
+
+
+def build_confirmed_requirements(facts: dict, preferences: dict) -> list[str]:
+    """Human-readable confirmed requirement lines for every clarify output."""
+    f = facts or {}
+    p = preferences or {}
+    lines = []
+
+    scenario_map = {
+        "family": "家庭出行",
+        "friends": "朋友出行",
+        "couple": "情侣出行",
+        "solo": "独自出行",
+    }
+    if f.get("scenario"):
+        lines.append(f"出行场景：{scenario_map.get(f['scenario'], f['scenario'])}")
+    if f.get("start_time"):
+        lines.append(f"出发时间：{f['start_time']}")
+    if f.get("duration_hours"):
+        lines.append(f"游玩时长：约{f['duration_hours']}小时")
+    if f.get("home_area") or f.get("detected_location"):
+        lines.append(f"出发地点：{f.get('home_area') or f.get('detected_location')}")
+
+    companions = [c for c in (f.get("companions") or []) if c not in ("self", "user", "me", "我", "自己", "本人")]
+    if companions:
+        label_map = {
+            "spouse": "配偶", "child": "孩子", "parents": "父母",
+            "friends": "朋友", "elderly": "老人", "partner": "另一半",
+            "family": "家人",
+        }
+        lines.append("同行人：" + "、".join(label_map.get(c, c) for c in companions))
+    elif f.get("companions_desc"):
+        lines.append(f"同行人：{f['companions_desc']}")
+
+    if f.get("child_age"):
+        lines.append(f"孩子年龄：{f['child_age']}岁")
+    if f.get("child_purpose"):
+        cp = {"education": "科普学习", "fun": "轻松好玩"}.get(f["child_purpose"], f["child_purpose"])
+        lines.append(f"孩子偏好：{cp}")
+    male_count = f.get("male_count", 0)
+    female_count = f.get("female_count", 0)
+    if male_count or female_count:
+        scenario = f.get("scenario", "")
+        label = "朋友构成" if scenario == "friends" else "同行性别"
+        lines.append(f"{label}：男{male_count}人、女{female_count}人")
+    if f.get("friends_activity_type"):
+        fat = {
+            "social": "社交互动", "exhibition": "文化展览",
+            "mall": "逛街购物", "photo_spot": "出片打卡", "mixed": "综合体验",
+        }.get(f["friends_activity_type"], f["friends_activity_type"])
+        lines.append(f"活动偏好：{fat}")
+
+    participant_preferences = f.get("participant_preferences") or {}
+    for owner in ("spouse", "self"):
+        owner_pref = participant_preferences.get(owner) or {}
+        label = _PARTICIPANT_LABELS.get(owner, owner)
+        details = []
+        if owner_pref.get("activity_preference_label"):
+            details.append(owner_pref["activity_preference_label"])
+        elif owner_pref.get("venue"):
+            details.append({"mall": "商场/购物中心", "indoor": "室内优先", "outdoor": "户外/公园"}.get(owner_pref["venue"], owner_pref["venue"]))
+        if owner_pref.get("food"):
+            details.append("饮食：" + "、".join(owner_pref["food"]))
+        if details:
+            lines.append(f"{label}：" + "；".join(details))
+    if f.get("preference_basis"):
+        basis_label = _PARTICIPANT_LABELS.get(f["preference_basis"], f["preference_basis"])
+        lines.append(f"当前取向：按{basis_label}")
+    if f.get("hard_constraints"):
+        owner = f["hard_constraints"].get("owner")
+        owner_label = _PARTICIPANT_LABELS.get(owner, owner or "用户")
+        lines.append(f"硬约束：优先满足{owner_label}")
+
+    food = p.get("food") or f.get("food_preferences") or []
+    if food:
+        lines.append("饮食偏好：" + "、".join(food))
+    venue = p.get("venue") or f.get("venue_preference")
+    if venue:
+        venue_label = {"mall": "商场/购物中心", "indoor": "室内优先", "outdoor": "户外/公园"}.get(venue, venue)
+        lines.append(f"场地偏好：{venue_label}")
+    if f.get("activity_preference_label"):
+        lines.append(f"具体活动：{f['activity_preference_label']}")
+    if f.get("special_needs"):
+        lines.append("特殊需求：" + "、".join(f["special_needs"]))
+    if p.get("skip_restaurant") or f.get("skip_restaurant"):
+        lines.append("餐食安排：不安排外出餐厅")
+
+    return lines
+
+
+def append_confirmed_requirements(message: str, facts: dict, preferences: dict) -> str:
+    lines = build_confirmed_requirements(facts, preferences)
+    if not lines:
+        return message
+    block = "已确定的需求：\n" + "\n".join(f"- {line}" for line in lines)
+    return f"{message}\n\n{block}"
+
+
+def enforce_planning_tool_args(name: str,
+                               args: dict,
+                               session_facts: dict,
+                               preferences: dict) -> dict:
+    """Force confirmed user demands into search tool parameters."""
+    patched = dict(args or {})
+    if name == "search_restaurants":
+        food = preferences.get("food") or session_facts.get("food_preferences") or []
+        if food:
+            existing = [p.strip() for p in str(patched.get("preferences", "")).split(",") if p.strip()]
+            patched["preferences"] = ",".join(_append_unique(existing, list(food)))
+
+    if name == "search_activities":
+        venue = preferences.get("venue") or session_facts.get("venue_preference")
+        activity_pref = session_facts.get("activity_preference")
+        categories = [c.strip() for c in str(patched.get("categories", "")).split(",") if c.strip()]
+        category_map = {
+            "mall": ["mall_exhibition"],
+            "indoor": ["indoor_playground", "mall_exhibition", "museum", "exhibition", "board_game"],
+            "outdoor": ["outdoor_park", "citywalk"],
+            "park": ["outdoor_park"],
+            "exhibition": ["museum", "exhibition"],
+            "citywalk": ["citywalk"],
+            "social": ["board_game"],
+            "playground": ["indoor_playground"],
+        }
+        forced = []
+        if activity_pref in category_map:
+            forced.extend(category_map[activity_pref])
+        elif venue in category_map:
+            forced.extend(category_map[venue])
+        if forced:
+            patched["categories"] = ",".join(_append_unique(categories, forced))
+
+    return patched
 
 # ── Provider detection ───────────────────────────────────────────────
 
@@ -567,8 +1195,12 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
         # Fallback: old non-tool approach
         activities = []
         restaurants = []
-        weather = {}
-        plan = _fallback_plan(activities, restaurants, weather, session_facts, preferences)
+        plan = _fallback_plan(
+            activities,
+            restaurants,
+            {"session_facts": session_facts, "preferences": preferences},
+            "full_managed",
+        )
         yield {"_type": "result", "plan": plan}
         return
 
@@ -582,15 +1214,16 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
         end_time = raw_end
     else:
         try:
-            sh, sm = map(int, start_time.split(":"))
-            total_min = sh * 60 + sm + int(duration_hours * 60)
-            eh, em = total_min // 60, total_min % 60
-            end_time = f"{min(eh, 23):02d}:{em:02d}"
+            total_min = _normalize_start_time_for_math(start_time) + int(duration_hours * 60)
+            end_time = _format_start_time(total_min)
         except Exception:
             end_time = "20:00"
 
     food_prefs  = preferences.get("food", [])
     venue_pref  = preferences.get("venue") or ""
+    skip_restaurant = bool(preferences.get("skip_restaurant") or session_facts.get("skip_restaurant"))
+    if skip_restaurant:
+        food_prefs = []
     has_child   = session_facts.get("has_children", session_facts.get("has_child", False))
     has_elderly = session_facts.get("has_elderly", False)
     child_age   = session_facts.get("child_age")
@@ -676,6 +1309,21 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
     if fat and fat in fat_map:
         constraints.append(f"朋友活动偏好={fat_map[fat]}：优先匹配此类场所（但仍受法律约束）")
 
+    hard_constraints = session_facts.get("hard_constraints") or {}
+    if hard_constraints.get("preference"):
+        owner = hard_constraints.get("owner", "user")
+        owner_label = _PARTICIPANT_LABELS.get(owner, owner)
+        constraints.append(
+            f"【用户指定优先级】当前必须按{owner_label}执行："
+            f"{json.dumps(hard_constraints['preference'], ensure_ascii=False)}"
+        )
+    soft_preferences = session_facts.get("soft_preferences") or {}
+    if soft_preferences:
+        constraints.append(
+            "其他人的偏好仅作为 soft preference 加分，不得覆盖上述用户指定优先级："
+            f"{json.dumps(soft_preferences, ensure_ascii=False)}"
+        )
+
     if not constraints:
         constraints.append("无特殊人员约束")
 
@@ -694,7 +1342,12 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
 
     # Build user demand instructions block
     demand_lines = []
-    if food_prefs:
+    if skip_restaurant:
+        demand_lines.append(
+            "- 用户已说明吃过饭/不需要用餐：本轮规划必须跳过 search_restaurants 和 get_queue_status，"
+            "finish_planning 的 nodes 中绝对不能出现 type=restaurant 的节点"
+        )
+    elif food_prefs:
         food_str = "、".join(food_prefs)
         demand_lines.append(
             f"- 用户要求吃「{food_str}」：调用 search_restaurants 时 preferences 参数必须填「{food_str}」，"
@@ -709,13 +1362,16 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
 
     if venue_pref == "mall":
         demand_lines.append(
-            "- 用户要求去商场：调用 search_activities 时 categories 参数填「mall」，"
-            "选活动时必须优先选商场/室内购物中心内的场所"
+            "- 用户要求去商场：调用 search_activities 时 categories 参数填「mall」"
+            "（系统会返回商场/购物中心类活动），选活动时必须优先选商场/室内购物中心内的场所"
         )
     elif venue_pref == "indoor":
-        demand_lines.append("- 用户偏好室内场所：优先选 venue.environment=indoor 的活动")
+        demand_lines.append(
+            "- 用户偏好室内：调用 search_activities 时 categories 参数填「indoor」"
+            "（系统会返回室内类活动），优先选 venue.environment=indoor 的活动"
+        )
     elif venue_pref == "outdoor":
-        demand_lines.append("- 用户偏好户外：优先选户外公园、开放景区等")
+        demand_lines.append("- 用户偏好户外：优先选户外公园、开放景区等活动")
 
     fat = session_facts.get("friends_activity_type")
     fat_label = {
@@ -737,32 +1393,83 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
         start_time=start_time,
         end_time=end_time,
         group_desc=group_desc,
-        food_prefs="、".join(food_prefs) if food_prefs else "不限",
+        food_prefs=("不安排餐食" if skip_restaurant else ("、".join(food_prefs) if food_prefs else "不限")),
         venue_pref=venue_pref if venue_pref else "不限",
         special_requirements=special,
         user_demand_instructions=user_demand_instructions,
         current_time=current_time,
         person_constraints=person_constraints,
     )
+    if skip_restaurant:
+        user_msg += (
+            "\n\n## 餐食跳过规则（最高优先级）\n"
+            "- 用户已经吃过饭或不需要餐食，本次只安排活动/轻活动/交通\n"
+            "- 禁止调用 search_restaurants、get_queue_status\n"
+            "- 禁止输出 type=restaurant 的节点\n"
+            "- 节点数量可以为 2-4 个活动节点，不因缺少餐厅而视为不合格"
+        )
+
+    system_prompt = prompts.AGENT_PLAN_SYSTEM
+    planning_tools = _at.PLANNING_TOOLS
+    if skip_restaurant:
+        system_prompt = prompts.AGENT_PLAN_SYSTEM + """
+
+## 动态工具约束：用户不需要餐食
+- 跳过 search_restaurants；该工具本轮不可用
+- 跳过 get_queue_status；没有餐厅节点无需查排队
+- finish_planning 的前提改为：已调用 get_weather 和 search_activities，且必要时调用 get_booking_status
+- 行程节点数允许 2-4 个，全部为 activity/light，严禁 restaurant
+"""
+        planning_tools = [
+            json.loads(json.dumps(tool, ensure_ascii=False))
+            for tool in _at.PLANNING_TOOLS
+            if tool.get("function", {}).get("name") not in {"search_restaurants", "get_queue_status"}
+        ]
+        for tool in planning_tools:
+            fn = tool.get("function", {})
+            if fn.get("name") == "finish_planning":
+                fn["description"] = (
+                    "收集足够数据后调用此工具提交最终行程方案。"
+                    "【前提】用户不需要餐食，本轮只需已调用 get_weather 和 search_activities，"
+                    "必要时调用 get_booking_status。"
+                    "【约束】nodes 中每个 poiId 必须来自工具返回的真实数据，严禁编造；"
+                    "严禁 restaurant 节点。"
+                )
 
     messages = [
-        {"role": "system", "content": prompts.AGENT_PLAN_SYSTEM},
+        {"role": "system", "content": system_prompt},
         {"role": "user",   "content": user_msg},
     ]
 
     seen_poi_ids:  set[str]        = set()
     seen_poi_data: dict[str, dict] = {}
     seen_poi_ids.add("walk_001")  # always allow walk nodes
+    planning_state = {
+        "user_context": {"session_facts": session_facts, "preferences": preferences},
+        "weather": None,
+        "seen_activities": [],
+        "seen_restaurants": [],
+        "activity_search_args": {},
+        "restaurant_search_args": {},
+        "queue_results": {},
+        "booking_results": {},
+        "route_results": {},
+        "route_risks": [],
+        "route_replacements": {},
+        "route_set_counts": {},
+        "route_exec_count": 0,
+    }
 
     MAX_ITERATIONS = 15
     consecutive_tool_errors = 0  # counter for auto-replan trigger
+    finish_reject_count = 0      # counter for finish_planning ID rejection
 
     for iteration in range(MAX_ITERATIONS):
         logger.info(f"[AgentPlan] iteration={iteration}")
 
         try:
             result = await _call_llm_with_tools(
-                messages, _at.PLANNING_TOOLS,
+                messages, planning_tools,
                 model_alias="fast_model",
                 max_tokens=4096,
             )
@@ -799,10 +1506,20 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
 
         for tc in tool_calls:
             name = tc["name"]
-            args = tc["args"]
+            args = enforce_planning_tool_args(name, tc["args"], session_facts, preferences)
 
             if name == "finish_planning":
                 nodes = args.get("nodes", [])
+                if skip_restaurant:
+                    before = len(nodes)
+                    nodes = [
+                        n for n in nodes
+                        if n.get("type") != "restaurant" and n.get("category") != "restaurant"
+                    ]
+                    removed = before - len(nodes)
+                    if removed:
+                        yield {"_type": "cot_step",
+                               "text": f"⚠️ 已移除 {removed} 个餐厅节点：用户已说明不需要餐食"}
                 valid_nodes = [n for n in nodes if n.get("poiId", "") in seen_poi_ids]
                 dropped = len(nodes) - len(valid_nodes)
                 if dropped:
@@ -811,7 +1528,7 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
 
                 if len(valid_nodes) >= 2:
                     # Accept: normalize field names and enrich display data from search results
-                    enriched = _enrich_nodes(valid_nodes, seen_poi_data)
+                    enriched = _clamp_nodes_to_day(_enrich_nodes(valid_nodes, seen_poi_data))
                     plan = {
                         "nodes": enriched,
                         "summary": args.get("summary", ""),
@@ -822,9 +1539,24 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
                     return
 
                 # Reject: nodes don't match any searched POI IDs
+                finish_reject_count += 1
                 valid_id_list = ", ".join(list(seen_poi_ids)[:10])
                 yield {"_type": "cot_step",
-                       "text": "⚠️ 节点 poiId 无效，需使用搜索结果中的真实 ID"}
+                       "text": f"⚠️ 节点 poiId 无效（第{finish_reject_count}次拒绝），需使用搜索结果中的真实 ID"}
+
+                # After 2 rejections, stop waiting for LLM and auto-build from real data
+                if finish_reject_count >= 2 and seen_poi_data:
+                    yield {"_type": "cot_step",
+                           "text": "🔄 多次 ID 无效，从已搜索数据中自动构建行程…"}
+                    auto_plan = _auto_finish_from_planning_state(
+                        planning_state, session_facts, preferences, skip_restaurant
+                    )
+                    if len(auto_plan.get("nodes", [])) >= 2:
+                        yield {"_type": "cot_step",
+                               "text": f"✅ 自动构建完成：{len(auto_plan['nodes'])} 个节点"}
+                        yield {"_type": "result", "plan": auto_plan}
+                        return
+
                 processed.append((tc, {
                     "error": (
                         "finish_planning 被拒绝：nodes 中的 poiId 不在已搜索的 POI 列表中。"
@@ -835,11 +1567,69 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
                 early_finish = True
                 break  # stop processing further tools in this batch
 
+            if _planning_state_ready(planning_state, skip_restaurant):
+                yield {"_type": "cot_step",
+                       "text": "✅ 已具备活动/餐饮/路线信息，后端强制收束规划"}
+                auto_plan = _auto_finish_from_planning_state(
+                    planning_state, session_facts, preferences, skip_restaurant
+                )
+                if len(auto_plan.get("nodes", [])) >= 2:
+                    yield {"_type": "result", "plan": auto_plan}
+                    return
+
+            cached_route = None
+            route_hint = ""
+            if name in ("estimate_routes", "route_check"):
+                sequence_key, set_key = _route_cache_keys(args)
+                cached_route = planning_state["route_results"].get(sequence_key)
+                set_counts = planning_state["route_set_counts"]
+                set_counts[set_key] = int(set_counts.get(set_key, 0)) + 1
+                same_set_retry = set_counts[set_key] > 1
+                route_exec_count = int(planning_state["route_exec_count"])
+
+                if cached_route:
+                    route_hint = "路线已估算，无需再次调用 estimate_routes，请调用 finish_planning。"
+                elif same_set_retry:
+                    cached_route = _nearest_route_result(planning_state["route_results"], set_key)
+                    route_hint = "同一批地点的路线已估算，无需调整顺序反复试算，请调用 finish_planning。"
+                elif route_exec_count >= 2:
+                    cached_route = _nearest_route_result(planning_state["route_results"], set_key)
+                    route_hint = "路线估算已达到全局上限，请基于现有结果调用 finish_planning。"
+                elif route_exec_count >= 1:
+                    known_sets = [
+                        key for key, count in planning_state["route_set_counts"].items()
+                        if key != set_key and count > 0
+                    ]
+                    if not known_sets:
+                        cached_route = _nearest_route_result(planning_state["route_results"], set_key)
+                        route_hint = "路线估算每轮只执行一次，请调用 finish_planning。"
+
+                if cached_route is not None:
+                    tool_result = {
+                        **dict(cached_route or {}),
+                        "cached": True,
+                        "message": route_hint,
+                    }
+                    yield {"_type": "cot_step", "text": "🔧 调用工具 estimate_routes"}
+                    yield {"_type": "cot_step", "text": f"   ↳ {route_hint}"}
+                    processed.append((tc, tool_result))
+                    if _planning_state_ready(planning_state, skip_restaurant):
+                        yield {"_type": "cot_step",
+                               "text": "✅ 路线重复调用已拦截，自动生成当前最优方案"}
+                        auto_plan = _auto_finish_from_planning_state(
+                            planning_state, session_facts, preferences, skip_restaurant
+                        )
+                        if len(auto_plan.get("nodes", [])) >= 2:
+                            yield {"_type": "result", "plan": auto_plan}
+                            return
+                    continue
+
             # Data tool: execute and emit CoT step
             yield {"_type": "cot_step", "text": f"🔧 调用工具 {name}"}
             tool_result = await _at.execute_tool(name, args, seen_poi_ids)
             summary = _at.summarize_tool_result(name, tool_result)
             yield {"_type": "cot_step", "text": f"   ↳ {summary}"}
+            _update_planning_state(planning_state, name, args, tool_result)
 
             # Track consecutive tool errors (empty results or error keys)
             is_error_result = (
@@ -876,18 +1666,18 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
 
     # Exceeded max iterations
     yield {"_type": "cot_step", "text": "⚠️ Agent 迭代超限，切换备用规划方式"}
-    plan = await plan_itinerary([], [], {}, {"session_facts": session_facts, "preferences": preferences}, "full_managed")
+    plan = _auto_finish_from_planning_state(
+        planning_state, session_facts, preferences, skip_restaurant
+    )
+    if len(plan.get("nodes", [])) < 2:
+        plan = await plan_itinerary(
+            planning_state.get("seen_activities", []),
+            planning_state.get("seen_restaurants", []),
+            planning_state.get("weather") or {},
+            {"session_facts": session_facts, "preferences": preferences},
+            "full_managed",
+        )
     yield {"_type": "result", "plan": plan}
-
-
-def _fallback_plan(activities: list, restaurants: list, weather: dict,
-                   session_facts: dict, preferences: dict) -> dict:
-    """Minimal plan when no API key available."""
-    return {
-        "nodes": [],
-        "summary": "（无API Key，请配置后重试）",
-        "cot": ["无法调用 LLM，行程为空"],
-    }
 
 
 _AGENT_ICON_MAP = {
@@ -896,7 +1686,387 @@ _AGENT_ICON_MAP = {
     "exhibition": "🎨", "livehouse": "🎵", "restaurant": "🍽️",
     "light_food": "🥗", "bar": "🍻", "park": "🌳", "museum": "🏛️",
     "cinema": "🎬", "sports": "⚽", "shopping": "🛍️",
+    "mall_exhibition": "🏬", "outdoor_park": "🌳", "bar_entertainment": "🍺",
 }
+
+
+def _auto_build_plan_from_data(seen_poi_data: dict,
+                                session_facts: dict, preferences: dict) -> dict:
+    """Build minimal valid plan from already-searched POI data when LLM repeatedly hallucinates IDs."""
+    activities  = [v for v in seen_poi_data.values() if v.get("type") == "activity"]
+    restaurants = [v for v in seen_poi_data.values() if v.get("type") == "restaurant"]
+    activities.sort(key=lambda x: x.get("rating", 0), reverse=True)
+    restaurants.sort(key=lambda x: x.get("rating", 0), reverse=True)
+
+    start_time = session_facts.get("start_time", "14:00")
+    try:
+        start_min = _normalize_start_time_for_math(start_time)
+        sh, sm = start_min // 60, start_min % 60
+    except Exception:
+        sh, sm = 14, 0
+
+    def add_min(h, m, d):
+        t = _add_minutes(h * 60 + m, d); return t // 60, t % 60
+
+    def fmt(h, m):
+        return _fmt_hhmm(h * 60 + m)
+
+    cur_h, cur_m = add_min(sh, sm, 20)
+    nodes = []
+
+    for act in activities[:2]:
+        dur = act.get("estimated_duration_min", 90)
+        eh, em = add_min(cur_h, cur_m, dur)
+        q = act.get("queue_min")
+        nodes.append({
+            "id": f"node_{len(nodes)+1:03d}",
+            "type": "activity",
+            "icon": _AGENT_ICON_MAP.get(act.get("category", ""), "🎯"),
+            "name": act.get("name", "活动"),
+            "sub": act.get("address", ""),
+            "timeStart": fmt(cur_h, cur_m),
+            "timeEnd": fmt(eh, em),
+            "distance": f"{act.get('distance_km', 0):.1f}公里",
+            "queueMin": q,
+            "queueText": f"约{q}分钟" if q else "无需排队",
+            "price": f"¥{act.get('ticket_price', 0)}/位" if act.get("ticket_price") else "免费",
+            "rating": act.get("rating"),
+            "tags": list(act.get("tags", []))[:3],
+            "reason": "评分最高候选",
+            "poiId": act.get("poi_id", ""),
+            "status": "planned", "pinned": False, "locked": False,
+            "risk_facts": act.get("risk_facts", []),
+            "business_hours": act.get("business_hours", ""),
+        })
+        cur_h, cur_m = add_min(eh, em, 20)
+
+    skip_restaurant = bool(
+        preferences.get("skip_restaurant") or session_facts.get("skip_restaurant")
+    )
+    if restaurants and not skip_restaurant:
+        rst = restaurants[0]
+        eh, em = add_min(cur_h, cur_m, 60)
+        q = rst.get("queue_min", 0)
+        nodes.append({
+            "id": f"node_{len(nodes)+1:03d}",
+            "type": "restaurant",
+            "icon": "🍽️",
+            "name": rst.get("name", "餐厅"),
+            "sub": rst.get("address", ""),
+            "timeStart": fmt(cur_h, cur_m),
+            "timeEnd": fmt(eh, em),
+            "distance": f"{rst.get('distance_km', 0):.1f}公里",
+            "queueMin": q,
+            "queueText": f"约{q}分钟" if q > 0 else "无需排队",
+            "price": f"¥{rst.get('avg_price', 80)}/位",
+            "rating": rst.get("rating"),
+            "tags": list(rst.get("tags", []))[:3],
+            "reason": "评分最高餐厅",
+            "poiId": rst.get("poi_id", ""),
+            "status": "planned", "pinned": False, "locked": False,
+            "risk_facts": rst.get("risk_facts", []),
+            "business_hours": rst.get("business_hours", ""),
+        })
+
+    if len(nodes) < 2:
+        return {"nodes": [], "summary": "", "cot": ["候选数据不足，无法自动构建"]}
+
+    nodes = _clamp_nodes_to_day(nodes)
+    return {
+        "nodes": nodes,
+        "summary": f"从 {len(seen_poi_data)} 个候选中自动选出 {len(nodes)} 个节点",
+        "cot": ["Agent 规划多次失败，已从搜索结果中取评分最高的候选自动构建行程"],
+    }
+
+
+def _route_cache_keys(args: dict) -> tuple[tuple, tuple]:
+    origin = str(args.get("origin") or args.get("from_poi") or "current_location")
+    destinations = args.get("destinations") or []
+    if isinstance(destinations, str):
+        destinations = [d.strip() for d in destinations.split(",") if d.strip()]
+    destinations = tuple(str(d) for d in destinations if d)
+    mode = str(args.get("mode") or args.get("transport_mode") or "taxi")
+    sequence_key = (origin, destinations, mode)
+    set_key = (origin, tuple(sorted(destinations)), mode)
+    return sequence_key, set_key
+
+
+def _nearest_route_result(route_results: dict, set_key: tuple) -> dict:
+    if not route_results:
+        return {}
+    for sequence_key, result in route_results.items():
+        origin, destinations, mode = sequence_key
+        if (origin, tuple(sorted(destinations)), mode) == set_key:
+            return result
+    return next(iter(route_results.values()))
+
+
+def _update_planning_state(state: dict, name: str, args: dict, result: dict) -> None:
+    if not isinstance(result, dict) or "error" in result:
+        return
+    if name == "get_weather":
+        state["weather"] = result
+    elif name == "search_activities":
+        state["seen_activities"] = list(result.get("items", []) or [])
+        state["activity_search_args"] = dict(args or {})
+    elif name == "search_restaurants":
+        state["seen_restaurants"] = list(result.get("items", []) or [])
+        state["restaurant_search_args"] = dict(args or {})
+    elif name == "get_queue_status":
+        poi_id = args.get("poi_id")
+        if poi_id:
+            state["queue_results"][poi_id] = result
+    elif name == "get_booking_status":
+        poi_id = args.get("poi_id")
+        if poi_id:
+            state["booking_results"][poi_id] = result
+    elif name in ("estimate_routes", "route_check"):
+        sequence_key, _ = _route_cache_keys(args)
+        state["route_results"][sequence_key] = result
+        state["route_exec_count"] = int(state.get("route_exec_count", 0)) + 1
+        state["route_risks"] = _detect_route_risks(result)
+
+
+def _planning_state_ready(state: dict, skip_restaurant: bool) -> bool:
+    if not state.get("weather"):
+        return False
+    activities = state.get("seen_activities") or []
+    restaurants = state.get("seen_restaurants") or []
+    if not activities:
+        return False
+    if not skip_restaurant and not restaurants:
+        return False
+    planned_candidate_count = len(activities[:2]) + (0 if skip_restaurant else min(len(restaurants), 1))
+    if planned_candidate_count >= 2 and not state.get("route_results"):
+        return False
+    return True
+
+
+def _detect_route_risks(route_result: dict, threshold_min: int = 35) -> list[dict]:
+    risks = []
+    for segment in route_result.get("segments", []) or []:
+        travel_time = int(segment.get("travel_time_min") or 0)
+        if travel_time > threshold_min:
+            risks.append({
+                "type": "route_risk",
+                "from": segment.get("from"),
+                "to": segment.get("to"),
+                "duration_min": travel_time,
+                "threshold_min": threshold_min,
+                "action": "replace_destination",
+            })
+    return risks
+
+
+def _replace_route_risky_candidates(selected: list[dict],
+                                    candidates: list[dict],
+                                    risky_ids: set[str],
+                                    replacement_counts: dict,
+                                    slot_key: str,
+                                    max_replacements: int = 3) -> list[dict]:
+    result = list(selected)
+    used_ids = {item.get("poi_id") for item in result}
+    for index, item in enumerate(list(result)):
+        poi_id = item.get("poi_id")
+        if poi_id not in risky_ids:
+            continue
+        count_key = f"{slot_key}:{index}"
+        count = int(replacement_counts.get(count_key, 0))
+        if count >= max_replacements:
+            item.setdefault("risk_facts", [])
+            item["risk_facts"] = _append_unique(
+                item.get("risk_facts", []),
+                ["路线偏远，已达到该节点最多3次替换上限"],
+            )
+            continue
+        replacement = next(
+            (
+                candidate for candidate in candidates
+                if candidate.get("poi_id") not in used_ids
+                and candidate.get("poi_id") not in risky_ids
+            ),
+            None,
+        )
+        if not replacement:
+            item.setdefault("risk_facts", [])
+            item["risk_facts"] = _append_unique(
+                item.get("risk_facts", []),
+                ["路线偏远，但暂无更近同类候选"],
+            )
+            continue
+        result[index] = replacement
+        used_ids.discard(poi_id)
+        used_ids.add(replacement.get("poi_id"))
+        replacement_counts[count_key] = count + 1
+    return result
+
+
+def _auto_finish_from_planning_state(state: dict, session_facts: dict,
+                                     preferences: dict,
+                                     skip_restaurant: bool = False) -> dict:
+    """Build a frontend-ready plan from collected tool state."""
+    activities = list(state.get("seen_activities") or [])
+    restaurants = [] if skip_restaurant else list(state.get("seen_restaurants") or [])
+    if not activities and not restaurants:
+        return {"nodes": [], "summary": "", "cot": ["规划状态中没有可用候选"]}
+
+    sf_for_score = {
+        **dict(session_facts or {}),
+        "food_preferences": preferences.get("food") or session_facts.get("food_preferences") or [],
+    }
+    activities = sorted(
+        [item for item in activities if item.get("open_status") != "closed"],
+        key=lambda item: _score_activity(item, sf_for_score),
+        reverse=True,
+    )
+    restaurants = sorted(
+        restaurants,
+        key=lambda item: _score_restaurant(item, sf_for_score),
+        reverse=True,
+    )
+
+    start_time = session_facts.get("start_time", "14:00")
+    try:
+        start_min = _normalize_start_time_for_math(start_time)
+        sh, sm = start_min // 60, start_min % 60
+    except Exception:
+        sh, sm = 14, 0
+
+    def add_min(h, m, d):
+        t = _add_minutes(h * 60 + m, d)
+        return t // 60, t % 60
+
+    def fmt(h, m):
+        return _fmt_hhmm(h * 60 + m)
+
+    def queue_for(poi_id: str, fallback: int | None = None) -> int:
+        queue = (state.get("queue_results") or {}).get(poi_id) or {}
+        return int(
+            queue.get("estimated_wait_min")
+            or queue.get("wait_minutes")
+            or fallback
+            or 0
+        )
+
+    def booking_for(poi_id: str) -> dict:
+        return (state.get("booking_results") or {}).get(poi_id) or {}
+
+    cur_h, cur_m = add_min(sh, sm, 20)
+    nodes = []
+    selected_activities = activities[:2]
+    selected_restaurants = restaurants[:1]
+    route_risks = state.get("route_risks") or []
+    risky_destination_ids = {
+        risk.get("to")
+        for risk in route_risks
+        if risk.get("action") == "replace_destination"
+    }
+    replacement_counts = state.setdefault("route_replacements", {})
+    selected_activities = _replace_route_risky_candidates(
+        selected_activities,
+        activities,
+        risky_destination_ids,
+        replacement_counts,
+        "activity",
+    )
+    selected_restaurants = _replace_route_risky_candidates(
+        selected_restaurants,
+        restaurants,
+        risky_destination_ids,
+        replacement_counts,
+        "restaurant",
+    )
+
+    for act in selected_activities:
+        dur = int(act.get("estimated_duration_min") or 90)
+        eh, em = add_min(cur_h, cur_m, dur)
+        poi_id = act.get("poi_id", "")
+        booking = booking_for(poi_id)
+        q = queue_for(poi_id, act.get("queue_min"))
+        tags = list(act.get("tags", []) or [])[:3]
+        reason = act.get("_llm_reason") or (tags[0] if tags else "匹配用户偏好")
+        if booking.get("availability") in ("limited", "low"):
+            reason = "余量紧张·" + reason
+        nodes.append({
+            "id": f"node_{len(nodes)+1:03d}",
+            "type": "activity",
+            "icon": _AGENT_ICON_MAP.get(act.get("category", ""), "🎯"),
+            "name": act.get("name", "活动"),
+            "sub": act.get("address", ""),
+            "timeStart": fmt(cur_h, cur_m),
+            "timeEnd": fmt(eh, em),
+            "distance": f"{act.get('distance_km', 0):.1f}公里",
+            "queueMin": q,
+            "queueText": f"约{q}分钟" if q > 0 else "无需排队",
+            "price": f"¥{act.get('ticket_price', 0)}/位" if act.get("ticket_price") else "免费",
+            "rating": act.get("rating"),
+            "tags": tags,
+            "reason": str(reason)[:30],
+            "poiId": poi_id,
+            "status": "planned", "pinned": False, "locked": False,
+            "booking_required": act.get("booking_required", False),
+            "booking_urgent": booking.get("availability") in ("limited", "low"),
+            "risk_facts": act.get("risk_facts", []),
+            "business_hours": act.get("business_hours", ""),
+        })
+        cur_h, cur_m = add_min(eh, em, 20)
+
+    if selected_restaurants:
+        rst = selected_restaurants[0]
+        eh, em = add_min(cur_h, cur_m, 60)
+        poi_id = rst.get("poi_id", "")
+        q = queue_for(poi_id, rst.get("queue_min"))
+        tags = list(rst.get("tags", []) or [])[:3]
+        food_prefs = preferences.get("food") or session_facts.get("food_preferences") or []
+        reason = "符合" + "、".join(food_prefs) if food_prefs else (tags[0] if tags else "餐厅候选最优")
+        nodes.append({
+            "id": f"node_{len(nodes)+1:03d}",
+            "type": "restaurant",
+            "icon": "🍽️",
+            "name": rst.get("name", "餐厅"),
+            "sub": rst.get("address", ""),
+            "timeStart": fmt(cur_h, cur_m),
+            "timeEnd": fmt(eh, em),
+            "distance": f"{rst.get('distance_km', 0):.1f}公里",
+            "queueMin": q,
+            "queueText": f"约{q}分钟" if q > 0 else "无需排队",
+            "price": f"¥{rst.get('avg_price', 80)}/位",
+            "rating": rst.get("rating"),
+            "tags": tags,
+            "reason": str(reason)[:30],
+            "poiId": poi_id,
+            "status": "planned", "pinned": False, "locked": False,
+            "booking_required": rst.get("booking_required", False),
+            "booking_urgent": rst.get("booking_required", False),
+            "risk_facts": rst.get("risk_facts", []),
+            "business_hours": rst.get("business_hours", ""),
+        })
+
+    if len(nodes) < 2:
+        return {"nodes": [], "summary": "", "cot": ["候选数据不足，无法自动收束"]}
+
+    nodes = _clamp_nodes_to_day(nodes)
+    route_count = len(state.get("route_results") or {})
+    weather = state.get("weather") or {}
+    route_risk_count = len(state.get("route_risks") or [])
+    replacement_total = sum(int(v) for v in (state.get("route_replacements") or {}).values())
+    route_note = (
+        f"检测到 {route_risk_count} 段路线偏远，已局部换点 {replacement_total} 次"
+        if route_risk_count else
+        "路线无明显偏远风险"
+    )
+    return {
+        "nodes": nodes,
+        "summary": f"已基于实时候选自动收束：{nodes[0]['name']} → {nodes[-1]['name']}",
+        "cot": [
+            "后端检测到规划信息已满足完成条件，自动收束",
+            "候选地点来自 Mock API 参数化搜索结果",
+            f"天气：{weather.get('condition', 'unknown')}",
+            f"路线估算结果：{route_count} 组",
+            route_note,
+            "已结合排队/预约状态生成可展示行程",
+        ],
+    }
 
 
 def _enrich_nodes(nodes: list[dict], poi_data: dict[str, dict]) -> list[dict]:
@@ -1019,6 +2189,7 @@ async def clarify_needs(message: str, current_time: str, location_hint: str = ""
 
 def _fallback_clarify(message: str, current_time: str, location_hint: str = "") -> dict:
     msg_lower = message.lower()
+    detected = detect_specific_preferences(message)
 
     # Detect scenario
     if any(w in message for w in ['孩子', '娃', '小朋友', '宝贝', '儿子', '女儿']):
@@ -1055,13 +2226,7 @@ def _fallback_clarify(message: str, current_time: str, location_hint: str = "") 
             h += 12
         start_time = f"{h:02d}:00"
     else:
-        # Default: current hour + 1, rounded to nearest :00/:30
-        try:
-            ch = int(current_time.split(':')[0])
-            sh = min(ch + 1, 20)
-        except Exception:
-            sh = 14
-        start_time = f"{sh:02d}:00"
+        start_time = _default_start_time_from_current(current_time)
 
     # Detect travel style
     if any(w in message for w in ['轻松', '慢慢', '休闲', '不累', '随便', '逛逛']):
@@ -1075,9 +2240,9 @@ def _fallback_clarify(message: str, current_time: str, location_hint: str = "") 
         style_label = '轻松休闲'
 
     # Detect food preferences
-    food_prefs = []
+    food_prefs = list(detected.get("food", []))
     if any(w in message for w in ['减肥', '减脂', '低卡', '清淡', '健康']):
-        food_prefs = ['清淡', '低油']
+        food_prefs = _append_unique(food_prefs, ['清淡', '低油'])
 
     # Build confirm message
     has_elderly = any(w in message for w in ['老人', '爸妈', '父母', '外公', '外婆', '奶奶', '爷爷'])
@@ -1098,6 +2263,13 @@ def _fallback_clarify(message: str, current_time: str, location_hint: str = "") 
     lines.append(f"✨ 出行风格：{style_label}")
     if food_prefs:
         lines.append(f"🥗 饮食偏好：{' + '.join(food_prefs)}")
+    if detected.get("venue"):
+        venue_label = {"mall": "商场/购物中心", "indoor": "室内优先", "outdoor": "户外/公园"}.get(detected["venue"], detected["venue"])
+        lines.append(f"📍 场地偏好：{venue_label}")
+    if detected.get("activity_preference_label"):
+        lines.append(f"🎯 活动偏好：{detected['activity_preference_label']}")
+    if detected.get("skip_restaurant"):
+        lines.append("🍽️ 餐食安排：已吃过/不安排餐食")
     if has_child:
         lines.append(f"👶 孩子年龄：（还没填，帮我补充一下？）")
     if has_elderly:
@@ -1117,9 +2289,13 @@ def _fallback_clarify(message: str, current_time: str, location_hint: str = "") 
         "special_needs": (['dietary_restriction'] if food_prefs else []),
         "travel_style": style,
         "food_preferences": food_prefs,
+        "venue_preference": detected.get("venue"),
+        "activity_preference": detected.get("activity_preference"),
+        "activity_preference_label": detected.get("activity_preference_label"),
+        "friends_activity_type": detected.get("friends_activity_type"),
         # skip_restaurant is determined by LLM in confirm_preferences;
         # fallback defaults to False (conservative)
-        "skip_restaurant": False,
+        "skip_restaurant": detected.get("skip_restaurant", False),
     }
 
     return {
@@ -1134,15 +2310,28 @@ def _fallback_clarify(message: str, current_time: str, location_hint: str = "") 
 # Skill 2: Confirm Preferences
 # ════════════════════════════════════════════════════════════════════
 
-async def confirm_preferences(inferred: dict, user_response: str) -> dict:
+def _format_clarify_history(history: list) -> str:
+    if not history:
+        return ""
+    lines = ["## 对话历史（按时间顺序，用于理解指代性表达如「按老婆的来」）"]
+    for i, msg in enumerate(history, 1):
+        lines.append(f"- 用户第{i}条：【{msg}】")
+    lines.append("---\n")
+    return "\n".join(lines) + "\n"
+
+
+async def confirm_preferences(inferred: dict, user_response: str,
+                              history: list = None) -> dict:
     """
     Extract final confirmed preferences from user's response to clarification.
+    history: list of prior user messages (strings) for context-aware refinement.
     Returns: {session_facts, preferences, ready_to_plan, start_message}
     """
     if not _has_api_key():
         return _fallback_confirm_prefs(inferred, user_response)
 
     user_p = prompts.CONFIRM_PREFS_USER.format(
+        history_section=_format_clarify_history(history),
         inferred=json.dumps(inferred, ensure_ascii=False),
         user_response=user_response,
     )
@@ -1153,8 +2342,15 @@ async def confirm_preferences(inferred: dict, user_response: str) -> dict:
             schema_hint='{"session_facts":{...},"preferences":{...},"ready_to_plan":true}',
             max_tokens=1024,
         )
-        facts, prefs = merge_specific_preferences(
-            result.get("session_facts", {}) or inferred,
+        base_preferences = {
+            "food": inferred.get("food_preferences", []),
+            "venue": inferred.get("venue_preference"),
+            "skip_restaurant": inferred.get("skip_restaurant", False),
+        }
+        facts, prefs = merge_confirmed_state(
+            inferred,
+            base_preferences,
+            result.get("session_facts", {}) or {},
             result.get("preferences", {}),
             user_response,
         )
@@ -1188,15 +2384,15 @@ def _fallback_confirm_prefs(inferred: dict, user_response: str) -> dict:
     elif any(w in user_response for w in ['活力', '多玩', '精彩']):
         prefs['travel_style'] = 'active'
 
-    # skip_restaurant is determined by the LLM in confirm_preferences().
-    # In the fallback (no LLM), we conservatively default to False.
-    # The LLM prompt in CONFIRM_PREFS_USER is responsible for detecting all
-    # natural language expressions like "回家吃"/"自己解决"/"不需要餐厅" etc.
-    skip_restaurant = False
+    detected_response = detect_specific_preferences(user_response)
+    skip_restaurant = bool(prefs.get("skip_restaurant") or detected_response.get("skip_restaurant"))
 
     # Extract explicit food/activity preferences
     prefs, detected_pref = merge_specific_preferences(prefs, {}, user_response)
     food_prefs = list(prefs.get('food_preferences', []))
+    if skip_restaurant:
+        food_prefs = []
+        prefs["food_preferences"] = []
     if any(w in user_response for w in ['老人', '爸妈', '父母']):
         prefs['has_elderly'] = True
 
@@ -1213,6 +2409,7 @@ def _fallback_confirm_prefs(inferred: dict, user_response: str) -> dict:
         "special_needs": prefs.get('special_needs', []),
         "home_area": "北京望京",
         "travel_style": style,
+        "skip_restaurant": skip_restaurant,
     }
 
     mode = "light_managed" if style == 'relaxed' else "full_managed"
@@ -1467,10 +2664,8 @@ async def plan_itinerary(activities: list, restaurants: list, weather: dict,
 
     # Pre-compute first node time so LLM can't get it wrong
     try:
-        sh, sm = map(int, sf.get("start_time", "14:00").split(":"))
-        fn_total = sh * 60 + sm + 20          # +20 min transit
-        fn_h, fn_m = fn_total // 60, fn_total % 60
-        first_node_time = f"{fn_h:02d}:{fn_m:02d}"
+        fn_total = _normalize_start_time_for_math(sf.get("start_time", "14:00")) + 20
+        first_node_time = _format_start_time(fn_total)
     except Exception:
         first_node_time = sf.get("start_time", "14:00")
 
@@ -1657,12 +2852,18 @@ def _fallback_plan(activities: list, restaurants: list, prefs: dict, mode: str) 
     has_child = sf.get("has_children", False) or (child_age is not None)
     has_elderly = sf.get("has_elderly", False)
     food_prefs  = sf.get("food_preferences", []) or prefs.get("preferences", {}).get("food", [])
-    skip_restaurant = prefs.get("preferences", {}).get("skip_restaurant", False)
+    skip_restaurant = bool(
+        prefs.get("preferences", {}).get("skip_restaurant", False)
+        or sf.get("skip_restaurant", False)
+    )
+    if skip_restaurant:
+        food_prefs = []
 
-    def add_min(h, m, d): t = h*60+m+d; return t//60, t%60
-    def fmt(h, m): return f"{h:02d}:{m:02d}"
+    def add_min(h, m, d): t = _add_minutes(h*60+m, d); return t//60, t%60
+    def fmt(h, m): return _fmt_hhmm(h*60+m)
 
-    sh, sm = map(int, sf.get("start_time", "14:00").split(":"))
+    start_min = _normalize_start_time_for_math(sf.get("start_time", "14:00"))
+    sh, sm = start_min // 60, start_min % 60
     cur_h, cur_m = add_min(sh, sm, 20)
     nodes = []
 
@@ -1770,6 +2971,7 @@ def _fallback_plan(activities: list, restaurants: list, prefs: dict, mode: str) 
 
     act_name = act["name"] if act else "活动"
     rst_name = rst["name"] if rst else "餐厅"
+    nodes = _clamp_nodes_to_day(nodes)
     return {
         "cot": [
             f"识别到：{scene_label}·{style_label}，出发时间 {sf.get('start_time','14:00')}",
@@ -2232,6 +3434,3 @@ def validate_feasibility(nodes: list, session_facts: dict) -> list[str]:
             )
 
     return risks
-
-
-

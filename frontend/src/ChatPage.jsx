@@ -46,6 +46,13 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  useEffect(() => {
+    if (itinerary?.length && itinerary.every(n => n._checked || n.completed_lock)) {
+      setChatPhase('completed')
+      setQuickReplies([])
+    }
+  }, [itinerary])
+
   // ── Monitor polling ───────────────────────────────────────────────
 
   const startMonitorPolling = useCallback(() => {
@@ -71,10 +78,11 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
           append({
             role: 'agent', type: 'exception',
             data: {
+              request_id: evt.request_id,
               exception_type: 'queue_spike',
               title: '餐厅排队突发拥堵',
               message: evt.message,
-              original: { id: 'node_002', name: evt.poi_id || '餐厅' },
+              original: { id: evt.node_id || 'node_002', name: evt.poi_id || '餐厅' },
               alternative: null,
             },
           })
@@ -82,6 +90,7 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
           append({
             role: 'agent', type: 'exception',
             data: {
+              request_id: evt.request_id,
               exception_type: 'weather_heavy_rain',
               title: '天气预警',
               message: evt.message,
@@ -129,6 +138,25 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
     let statusId = null
     let cotId = null
 
+    const ensurePlanningCards = () => {
+      clearTyping()
+      setChatPhase('planning')
+      if (!statusId) {
+        statusId = append({
+          role: 'agent', type: 'status',
+          items: [
+            { id: 1, text: '需求已确认', status: 'done' },
+            { id: 2, text: '搜索附近活动', status: 'loading' },
+            { id: 3, text: '查询排队情况', status: 'pending' },
+            { id: 4, text: 'AI 规划中', status: 'pending' },
+          ],
+        })
+      }
+      if (!cotId) {
+        cotId = append({ role: 'agent', type: 'thinking', steps: [], collapsed: false })
+      }
+    }
+
     await api.streamChat(sessionId, text, (evt) => {
       switch (evt.type) {
         // ── Phase: gathering / confirming → clarify ─────────────────
@@ -164,6 +192,7 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
 
         // ── Status updates ──────────────────────────────────────────
         case 'status':
+          ensurePlanningCards()
           if (statusId) {
             update(statusId, m => ({
               ...m,
@@ -178,6 +207,7 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
 
         // ── CoT steps ───────────────────────────────────────────────
         case 'cot_step':
+          ensurePlanningCards()
           if (cotId) {
             update(cotId, m => ({ ...m, steps: [...m.steps, evt.text] }))
           }
@@ -230,6 +260,16 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
         case 'text':
           clearTyping()
           append({ role: 'agent', type: 'text', content: evt.content || evt.message || '' })
+          break
+
+        case 'itinerary_updated':
+          if (itineraryMsgId && evt.nodes) {
+            update(itineraryMsgId, m => ({ ...m, nodes: evt.nodes }))
+          }
+          if (onItineraryUpdate) onItineraryUpdate(evt.nodes || [])
+          if (onProfileUpdate && (evt.facts || evt.preferences)) {
+            onProfileUpdate({ facts: evt.facts, preferences: evt.preferences, phase: evt.phase || 'monitoring' })
+          }
           break
 
         // ── Error ─────────────────────────────────────────────────────
@@ -308,6 +348,7 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
 
     await api.streamExceptionConfirm(sessionId, {
       confirmed: true,
+      request_id: exceptionData.request_id,
       exception_type: exceptionData.exception_type,
       original_node_id: exceptionData.original?.id,
       recommended: exceptionData.alternative,
@@ -349,6 +390,21 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
     }).finally(() => setIsStreaming(false))
   }, [sessionId, isStreaming, itineraryMsgId, append, update])
 
+  const dismissException = useCallback(async (exceptionData) => {
+    if (!sessionId) return
+    append({ role: 'user', type: 'text', content: '暂不处理，先保留原方案。' })
+    await api.streamExceptionConfirm(sessionId, {
+      confirmed: false,
+      request_id: exceptionData.request_id,
+      exception_type: exceptionData.exception_type,
+      original_node_id: exceptionData.original?.id,
+    }, (evt) => {
+      if (evt.type === 'text') {
+        append({ role: 'agent', type: 'text', content: evt.content || evt.message || '' })
+      }
+    })
+  }, [sessionId, append])
+
   // ── User report ───────────────────────────────────────────────────
 
   const submitReport = useCallback(async (type, label) => {
@@ -388,6 +444,7 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
         node_id: result.node_id,
         action:  result.action,
         reason:  result.reason,
+        request_id: result.request_id,
       })
       return
     }
@@ -397,9 +454,9 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
   }, [sessionId, itineraryMsgId, update, append])
 
   // User confirmed soft-lock warning → force execute
-  const handleSoftLockConfirm = useCallback(async (nodeId, action) => {
+  const handleSoftLockConfirm = useCallback(async (nodeId, action, requestId) => {
     if (!sessionId) return
-    const result = await api.nodeAction(sessionId, nodeId, action, true)
+    const result = await api.nodeAction(sessionId, nodeId, action, true, requestId)
     if (result.nodes && itineraryMsgId) {
       update(itineraryMsgId, m => ({ ...m, nodes: result.nodes }))
       if (onItineraryUpdate) onItineraryUpdate(result.nodes)
@@ -407,15 +464,29 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
     append({ role: 'agent', type: 'text', content: '已取消预约，该节点已从行程中移除。' })
   }, [sessionId, itineraryMsgId, update, append, onItineraryUpdate])
 
+  const handleSoftLockDismiss = useCallback(async (_nodeId, _action, requestId) => {
+    if (!sessionId || !requestId) return
+    await api.resolveConfirmation(sessionId, requestId, false, {}, 'user_rejected')
+    append({ role: 'agent', type: 'text', content: '已保留原方案，预约和排队资格不会释放。' })
+  }, [sessionId, append])
+
   // ── Send message ──────────────────────────────────────────────────
 
   const handleSend = useCallback((text) => {
     if (!text.trim() || !sessionId) return
-    // Save first user message as the original request context
-    if (!originalRequest) setOriginalRequest(text)
+    const shouldStartNextRound = chatPhase === 'completed'
+    if (chatPhase === 'completed') {
+      setOriginalRequest(text)
+      setItineraryMsgId(null)
+      if (onItineraryUpdate) onItineraryUpdate([])
+      setChatPhase('gathering')
+    } else if (!originalRequest) {
+      // Save first user message as the original request context
+      setOriginalRequest(text)
+    }
     append({ role: 'user', type: 'text', content: text })
-    runChat(text)
-  }, [sessionId, append, runChat, originalRequest])
+    runChat(text, shouldStartNextRound ? { phase_hint: 'new_round' } : {})
+  }, [sessionId, append, runChat, originalRequest, chatPhase, onItineraryUpdate])
 
   // ── Quick reply handler ───────────────────────────────────────────
 
@@ -446,6 +517,7 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
         break
       case 'dashboard':
         append({ role: 'agent', type: 'text', content: '🎉 今天的行程全部安排好了！祝出行顺利～' })
+        setChatPhase('completed')
         setQuickReplies([])
         break
     }
@@ -502,8 +574,10 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
             onNodeAction={handleNodeAction}
             onTransitChange={onTransitChange}
             onExceptionConfirm={confirmException}
+            onExceptionDismiss={dismissException}
             onReportSelect={(type, label) => submitReport(type, label)}
             onSoftLockConfirm={handleSoftLockConfirm}
+            onSoftLockDismiss={handleSoftLockDismiss}
           />
         ))}
         <div ref={bottomRef} />

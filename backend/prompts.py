@@ -115,6 +115,17 @@ CLARIFY_USER = """用户说：{message}
   "missing_fields": ["child_age", "elderly_no_walking"]
 }}
 
+## companions / 同行人规则（优先级：高）
+- companions 只列同行的**其他人**，不含用户本人；例："我和老婆带孩子" → ["spouse","child"]
+- companions_desc 也只描述其他人；例："配偶+孩子"，而不是"你和老婆孩子"
+
+## group_gender / 性别规则（优先级：高）
+- male_count 和 female_count 只统计**性别已知的他人**，不含用户本人（除非用户明确说了自己是男/女）
+- 若用户未表明性别（例如只说"老婆喜欢…我喜欢…"但未说"我是男生"），**不要**把用户加入 male_count 或 female_count
+- group_gender：只能从用户明确的陈述推断；若用户性别未知则 group_gender="unknown"，即使知道其他人性别也不因此推断用户性别
+- 示例："我和老婆带孩子" → female_count=1（老婆），male_count=0（用户性别未知），group_gender="unknown"
+- 示例："我（男）和三个哥们" → male_count=4，female_count=0，group_gender="all_male"
+
 ## venue_preference 识别规则（优先级：高）
 - 用户提到"商场"、"购物中心"、"Mall"、"室内mall" → venue_preference="mall"
 - 用户提到"室内"、"不想晒太阳"、"空调" → venue_preference="indoor"
@@ -149,10 +160,24 @@ CONFIRM_PREFS_SYSTEM = BUTLER_SYSTEM + """
 优先保留用户明确说的信息，用户没纠正的推测内容保持不变。
 只输出 JSON，禁止任何其他文字。"""
 
-CONFIRM_PREFS_USER = """初始推测：
+CONFIRM_PREFS_USER = """{history_section}初始推测：
 {inferred}
 
 用户回应：{user_response}
+
+## 指代消解规则（重要）
+- 若用户说"按 A 的喜好/意见来"，必须从对话历史中找出 A 表达过什么偏好，并更新对应字段
+  - 例：历史有"老婆喜欢逛商场" → "按老婆的来" → preferences.venue 必须设为 "mall"
+  - 例：历史有"我喜欢公园" → "按我的来" → preferences.venue 必须设为 "outdoor"
+- 若用户说"就这样/可以/没问题"，表示认可推测，保持 inferred 不变
+- 若用户说"算了/随便/都行"后紧跟某人的偏好，按该人偏好执行
+
+## venue 字段取值（必须严格使用以下英文值）
+- 商场/购物中心/逛街 → "mall"
+- 公园/户外/室外/大自然 → "outdoor"
+- 室内/空调/不晒 → "indoor"
+- 两者都提及且无明确偏向 → "mixed"
+- 未提及 → null（继承 inferred.venue_preference）
 
 输出最终确认的偏好 JSON：
 {{
@@ -204,6 +229,11 @@ CONFIRM_PREFS_USER = """初始推测：
 - child_purpose、elderly_no_walking、friends_activity_type、性别偏好字段一旦确认，必须保留
 - inferred.food_preferences → preferences.food（必须完整继承，绝不能丢弃）
 - inferred.venue_preference → preferences.venue（必须完整继承）
+
+## companions / 性别规则
+- companions 只列同行的**其他人**，不含用户本人（"self"/"user" 不得出现在 companions 中）
+- male_count / female_count 只统计**性别已知的他人**，不含用户本人，除非用户本轮明确说了自己性别
+- 若用户未在本次对话中明确性别，不得将用户加入 male_count 或 female_count；group_gender 保持 "unknown"
 
 ## skip_restaurant 传递规则
 - 若 inferred.skip_restaurant 已为 true，preferences.skip_restaurant 必须继承为 true
@@ -565,7 +595,7 @@ AGENT_PLAN_SYSTEM = BUTLER_SYSTEM + """
 
 ## 工具调用参数规则（严格执行）
 - search_restaurants：若用户有饮食偏好（如川菜/粤菜/火锅/轻食等），**必须**将其填入 preferences 参数；没有偏好才可以不填
-- search_activities：不传 categories 参数（获取全量候选）；若用户偏好商场/室内，从结果中优先选 category 为 mall_exhibition 或 indoor_playground 或 board_game 的活动
+- search_activities：若用户偏好商场（venue_preference=mall），categories 参数填「mall」；若用户偏好室内，categories 参数填「indoor」；否则不传 categories
 
 ## 用户具体需求优先级（最高）
 - 用户明确说出的具体需求（菜系、场地类型、活动类型等）**必须被满足**，视同硬性约束
