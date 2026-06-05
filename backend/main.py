@@ -27,6 +27,7 @@ from backend.schemas import (
 )
 from backend.session import SessionManager
 from backend.orchestrator import Orchestrator
+from backend.team_agent_adapter import TeamAgentAdapter
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -43,6 +44,13 @@ app.add_middleware(
 
 manager = SessionManager()
 orchestrator = Orchestrator(manager)
+USE_TEAM_AGENT = os.getenv("USE_TEAM_AGENT", "1") != "0"
+team_adapter = None
+if USE_TEAM_AGENT:
+    try:
+        team_adapter = TeamAgentAdapter(manager)
+    except Exception:
+        logger.exception("TeamAgentAdapter failed to initialize; falling back to original backend")
 
 
 # ── SSE helper ───────────────────────────────────────────────────────
@@ -68,7 +76,12 @@ def sse_response(gen):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "meituan-agent", "version": "2.0.0"}
+    return {
+        "status": "ok",
+        "service": "meituan-agent",
+        "version": "2.0.0",
+        "team_agent": bool(team_adapter),
+    }
 
 
 @app.post("/agent/session")
@@ -80,8 +93,13 @@ async def create_session():
 
 @app.delete("/agent/{session_id}/reset")
 async def reset_session(session_id: str):
-    await orchestrator.stop_background_watch(session_id)
-    await orchestrator.cancel_confirmations(session_id)
+    if team_adapter:
+        await team_adapter.stop_background_watch(session_id)
+        await team_adapter.cancel_confirmations(session_id)
+        await team_adapter.cancel_session(session_id)
+    else:
+        await orchestrator.stop_background_watch(session_id)
+        await orchestrator.cancel_confirmations(session_id)
     manager.reset(session_id)
     return {"status": "reset", "session_id": session_id}
 
@@ -126,6 +144,12 @@ async def chat(session_id: str, req: ChatRequest):
         )
     logger.info(f"Chat: {session_id[:8]} phase={manager.get_phase(session_id)} "
                 f"hint={req.phase_hint} msg={req.message[:30]}")
+    if team_adapter:
+        return sse_response(
+            team_adapter.run_chat(session_id, req.message,
+                                  phase_hint=req.phase_hint,
+                                  original_request=req.original_request)
+        )
     return sse_response(
         orchestrator.run_chat(session_id, req.message,
                               phase_hint=req.phase_hint,
@@ -148,6 +172,8 @@ async def plan(session_id: str, req: PlanRequest):
 async def fulfill(session_id: str):
     manager.get_or_create(session_id)   # never 404 — recreates if lost after restart
     logger.info(f"Fulfill started: {session_id[:8]}")
+    if team_adapter:
+        return sse_response(team_adapter.run_fulfill(session_id))
     return sse_response(orchestrator.run_fulfill(session_id))
 
 
@@ -183,6 +209,8 @@ async def node_action(session_id: str, req: NodeActionRequest):
     s = manager.get(session_id)
     if not s:
         raise HTTPException(404, "Session not found")
+    if team_adapter:
+        return await team_adapter.node_action(session_id, req)
 
     itinerary = manager.get_itinerary(session_id)
     target = next((n for n in itinerary if n["id"] == req.node_id), None)
@@ -278,6 +306,8 @@ async def report_issue(session_id: str, req: ReportRequest):
     s = manager.get(session_id)
     if not s:
         raise HTTPException(404, "Session not found")
+    if team_adapter:
+        return await team_adapter.run_report(session_id, req.type)
     result = await orchestrator.run_report(session_id, req.type)
     return result
 
