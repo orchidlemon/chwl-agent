@@ -114,7 +114,16 @@ async def chat(session_id: str, req: ChatRequest):
     phase_hint="start_plan" + original_request lets backend plan correctly
     even when session was reset (e.g. dev reload).
     """
-    manager.get_or_create(session_id)
+    _, session = manager.get_or_create(session_id)
+    if req.client_itinerary and not manager.get_itinerary(session_id):
+        manager.set_itinerary(session_id, req.client_itinerary)
+        session["phase"] = "monitoring"
+        manager.add_monitor_event(
+            session_id,
+            "main_agent",
+            "Recovered visible itinerary from frontend request",
+            "session_recovered",
+        )
     logger.info(f"Chat: {session_id[:8]} phase={manager.get_phase(session_id)} "
                 f"hint={req.phase_hint} msg={req.message[:30]}")
     return sse_response(

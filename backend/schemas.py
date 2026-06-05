@@ -6,6 +6,7 @@ class ChatRequest(BaseModel):
     message: str
     phase_hint: Optional[str] = None   # "start_plan" when user clicks the planning button
     original_request: Optional[str] = None  # user's first message, sent alongside start_plan
+    client_itinerary: Optional[List[dict]] = None  # visible frontend itinerary, used to recover after backend reload
 
 
 class PlanRequest(BaseModel):

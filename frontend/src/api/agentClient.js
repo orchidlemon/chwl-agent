@@ -84,6 +84,7 @@ export function streamChat(sessionId, message, onEvent, opts = {}) {
   const payload = { message }
   if (opts.phase_hint)       payload.phase_hint       = opts.phase_hint
   if (opts.original_request) payload.original_request = opts.original_request
+  if (opts.client_itinerary) payload.client_itinerary = opts.client_itinerary
   return streamPost(`${BASE}/${sessionId}/chat`, payload, onEvent)
 }
 

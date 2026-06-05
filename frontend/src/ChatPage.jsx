@@ -485,8 +485,11 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
       setOriginalRequest(text)
     }
     append({ role: 'user', type: 'text', content: text })
-    runChat(text, shouldStartNextRound ? { phase_hint: 'new_round' } : {})
-  }, [sessionId, append, runChat, originalRequest, chatPhase, onItineraryUpdate])
+    runChat(text, {
+      ...(shouldStartNextRound ? { phase_hint: 'new_round' } : {}),
+      ...(itinerary?.length ? { client_itinerary: itinerary } : {}),
+    })
+  }, [sessionId, append, runChat, originalRequest, chatPhase, onItineraryUpdate, itinerary])
 
   // ── Quick reply handler ───────────────────────────────────────────
 
