@@ -8,7 +8,7 @@
   <a href="#"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <a href="#"><img src="https://img.shields.io/badge/Python-3.9+-blue?logo=python" alt="Python"></a>
   <a href="#"><img src="https://img.shields.io/badge/LLM-DeepSeek%20%7C%20Anthropic-green" alt="LLM"></a>
-  <a href="#"><img src="https://img.shields.io/badge/FastAPI-2.0.0-teal?logo=fastapi" alt="FastAPI"></a>
+  <a href="#"><img src="https://img.shields.io/badge/FastAPI-0.115.0-teal?logo=fastapi" alt="FastAPI"></a>
   <a href="#"><img src="https://img.shields.io/badge/Frontend-React%20%2B%20Vite-blue?logo=react" alt="React"></a>
 </p>
 
@@ -75,15 +75,22 @@
 
 ### 🔧 工具调用 + 规则引擎
 
-LLM 通过 Function Calling 调用 8 个真实数据工具：
+LLM 通过 `tools/server.py`（MCP Tool Server）分两阶段调用工具：
 
+**规则预规划阶段（5 个规则工具，来自 `rules/`）：**
 ```
-get_weather → search_activities → search_restaurants
-→ get_queue_status → get_booking_status → estimate_routes
+check_age_policy / check_food_policy / check_group_policy
+/ check_time_policy / check_itinerary_structure
+```
+
+**规划主循环阶段（9 个数据工具）：**
+```
+search_activity → search_restaurant → search_alternative
+→ check_weather → check_availability → check_queue → estimate_route
 → check_itinerary_structure → finish_planning
 ```
 
-每个规则（年龄/饮食/团体/时间/行程结构）都是独立 Python 模块，非 LLM Prompt 硬编码。
+每个规则（年龄/饮食/团体/时间/行程结构）都是独立 Python 模块，经 `tools/server.py` 封装为 LLM 可调用工具，非 Prompt 硬编码。
 
 ### 🛡️ 输出安全层
 
@@ -318,18 +325,26 @@ chwl-agent/
 │   │   └── store.py
 │   └── run_mock_api.ps1
 │
-├── rules/                      # 独立规则模块（非 Prompt 硬编码）
-│   ├── age_policy.py           # 年龄规则（儿童/老人约束）
-│   ├── food_policy.py          # 饮食规则
-│   ├── group_policy.py         # 团体规则
-│   ├── time_policy.py          # 时间窗口规则
-│   └── itinerary_structure.py  # 行程结构校验（6 条硬规则）
+├── rules/                      # 独立规则模块（非 Prompt 硬编码），经 tools/server.py 封装为 LLM 工具
+│   ├── age_policy.py           # 年龄规则（儿童/老人约束）→ check_age_policy
+│   ├── food_policy.py          # 饮食规则               → check_food_policy
+│   ├── group_policy.py         # 团体规则               → check_group_policy
+│   ├── time_policy.py          # 时间窗口规则            → check_time_policy
+│   └── itinerary_structure.py  # 行程结构校验（6 条硬规则）→ check_itinerary_structure
 │
-├── tools/                      # LLM 可调用工具的独立定义
-│   ├── categories/             # 按类别组织的工具定义
-│   │   ├── search.py / routing.py / monitoring.py / ...
-│   ├── server.py               # Tool server
-│   └── defaults.py
+├── tools/                      # MCP Tool Server — 统一暴露规则工具 + 数据工具给 LLM
+│   ├── categories/             # 按类别实现的工具函数
+│   │   ├── search.py           # Discovery: search_activity / search_restaurant / search_alternative
+│   │   ├── routing.py          # Validation: estimate_route
+│   │   ├── realtime.py         # Validation: get_queue_status / get_booking_status
+│   │   ├── validation.py       # Validation: check_weather / check_availability / check_queue
+│   │   ├── execution.py        # Execution: book_ticket / book_restaurant / share_plan
+│   │   ├── monitoring.py       # Monitoring: watch_queue / watch_weather / watch_booking
+│   │   ├── discovery.py        # 底层 POI 搜索实现
+│   │   ├── environment.py      # 环境数据（天气/位置/事件）
+│   │   └── fulfillment.py      # 履约执行封装
+│   ├── server.py               # Tool Server 入口：schema 注册、分组获取、统一执行调度
+│   └── defaults.py             # 工具默认参数
 │
 ├── start.ps1                   # Windows 一键启动脚本
 ├── .gitignore
@@ -412,15 +427,17 @@ chwl-agent/
 
 ### LLM Provider 支持
 
-系统支持两种 LLM 引擎：
+系统支持三种 LLM 引擎：
 
 ```python
 # backend/skills.py
 if provider == "anthropic":
     # 使用 Anthropic Claude API
-    # DeepSeek-reasoner 的 reasoning_content 直接作为 CoT 展示步骤
 elif provider == "deepseek":
     # 使用 DeepSeek Chat / Reasoner API
+    # DeepSeek-reasoner 的 reasoning_content 直接作为 CoT 展示步骤
+elif provider == "longcat":
+    # 使用 LongCat API
 ```
 
 切换方式：修改 `.env` 中的 `LLM_PROVIDER` 字段。
