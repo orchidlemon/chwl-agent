@@ -1,0 +1,1 @@
+# mock_api uses only Python stdlib — no extra packages needed

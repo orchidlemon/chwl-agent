@@ -3,7 +3,8 @@
  * All requests go to /agent/* (proxied to :8001 by Vite).
  */
 
-const BASE = '/agent'
+const BASE = (import.meta.env.VITE_AGENT_URL || '') + '/agent'
+const API_BASE = (import.meta.env.VITE_API_URL || '') + '/api'
 
 // ── Session ─────────────────────────────────────────────────────────
 
@@ -310,7 +311,7 @@ export async function getQueueAdvice(sessionId) {
 
 export async function getUserLocation() {
   try {
-    const r = await fetch('/api/location/current')
+    const r = await fetch(`${API_BASE}/location/current`)
     if (!r.ok) return null
     return r.json()
   } catch (_) { return null }

@@ -9,8 +9,9 @@ from mock_data import BASE_STATE, CITYWALKS, POIS, ROUTES
 from memory_store import BASE_MEMORY
 
 
-HOST = "127.0.0.1"
-PORT = 8000
+import os
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 8000))
 
 STATE = copy.deepcopy(BASE_STATE)
 MEMORY = copy.deepcopy(BASE_MEMORY)
