@@ -160,9 +160,7 @@ async def fulfill(session_id: str):
 
 @app.post("/agent/{session_id}/exception/confirm")
 async def confirm_exception(session_id: str, req: ExceptionConfirmRequest):
-    s = manager.get(session_id)
-    if not s:
-        raise HTTPException(404, "Session not found")
+    manager.get_or_create(session_id)
     return sse_response(orchestrator.run_exception_confirm(session_id, req.dict()))
 
 
@@ -170,7 +168,7 @@ async def confirm_exception(session_id: str, req: ExceptionConfirmRequest):
 async def resolve_confirmation(session_id: str, req: ConfirmationResolveRequest):
     s = manager.get(session_id)
     if not s:
-        raise HTTPException(404, "Session not found")
+        return {"resolved": False, "request": None}
     resolved = await orchestrator.confirmation_gateway.resolve(
         session_id,
         req.request_id,
@@ -187,7 +185,7 @@ async def resolve_confirmation(session_id: str, req: ConfirmationResolveRequest)
 async def node_action(session_id: str, req: NodeActionRequest):
     s = manager.get(session_id)
     if not s:
-        raise HTTPException(404, "Session not found")
+        return {"error": "session_expired"}
 
     itinerary = manager.get_itinerary(session_id)
     target = next((n for n in itinerary if n["id"] == req.node_id), None)
@@ -285,7 +283,7 @@ async def node_update(session_id: str, req: NodeUpdateRequest):
 async def node_checkin(session_id: str, req: NodeCheckinRequest):
     s = manager.get(session_id)
     if not s:
-        raise HTTPException(404, "Session not found")
+        return {"message": "session_expired", "next_requires_taxi": False}
     result = await orchestrator.run_node_checkin(session_id, req.node_id)
     return result
 
@@ -296,7 +294,7 @@ async def node_checkin(session_id: str, req: NodeCheckinRequest):
 async def report_issue(session_id: str, req: ReportRequest):
     s = manager.get(session_id)
     if not s:
-        raise HTTPException(404, "Session not found")
+        return {"status": "ok"}
     result = await orchestrator.run_report(session_id, req.type)
     return result
 
@@ -307,7 +305,7 @@ async def report_issue(session_id: str, req: ReportRequest):
 async def queue_advice(session_id: str):
     s = manager.get(session_id)
     if not s:
-        raise HTTPException(404, "Session not found")
+        return {"advices": []}
     advices = await orchestrator.run_queue_advice(session_id)
     return {"advices": advices}
 
@@ -318,7 +316,8 @@ async def queue_advice(session_id: str):
 async def monitor_state(session_id: str):
     s = manager.get(session_id)
     if not s:
-        raise HTTPException(404, "Session not found")
+        return {"events": [], "itinerary": [], "pending_chat_event": None,
+                "queue_history": {}, "weather": None}
 
     from backend import tools as _tools
     import asyncio as _asyncio
@@ -353,7 +352,7 @@ async def monitor_state(session_id: str):
 async def simulator_advance(session_id: str):
     s = manager.get(session_id)
     if not s:
-        raise HTTPException(404, "Session not found")
+        return {"status": "no_session"}
     result = await orchestrator.run_simulator_advance(session_id)
     return result
 
@@ -364,7 +363,7 @@ async def simulator_advance(session_id: str):
 async def simulator_inject(session_id: str, req: InjectEventTextRequest):
     s = manager.get(session_id)
     if not s:
-        raise HTTPException(404, "Session not found")
+        return {"status": "no_session"}
     result = await orchestrator.run_simulator_inject(session_id, req.text)
     return result
 
@@ -436,7 +435,7 @@ async def get_itinerary(session_id: str):
 async def trigger_event(session_id: str, event_type: str = "queue_spike"):
     s = manager.get(session_id)
     if not s:
-        raise HTTPException(404, "Session not found")
+        return {"status": "no_session"}
     if event_type == "queue_spike":
         event = manager.trigger_queue_spike(session_id)
     elif event_type == "weather_heavy_rain":
