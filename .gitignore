@@ -9,6 +9,10 @@ chwl-agent-main (2)/
 .venv/
 venv/
 
+# Node / frontend
+node_modules/
+dist/
+
 # Logs and runtime artifacts
 *.log
 .env
