@@ -219,11 +219,15 @@ cp .env.example .env
 
 ```ini
 # LLM 提供商 (deepseek / anthropic / longcat)
-LLM_PROVIDER=deepseek
+LLM_PROVIDER=longcat
 
 # DeepSeek
 DEEPSEEK_API_KEY=sk-your-key-here
 DEEPSEEK_BASE_URL=https://api.deepseek.com
+
+# longcat
+LONGCAT_API_KEY=
+LONGCAT_BASE_URL=https://api.longcat.chat/openai
 
 # 或使用 Anthropic
 # LLM_PROVIDER=anthropic
