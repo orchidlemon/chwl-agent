@@ -42,7 +42,17 @@
     ├─ 5️⃣ 后台监控 → 7×24 盯排队、天气、预约余量变化
     └─ 6️⃣ 异常重规划 → 排队暴增/下雨/疲劳 → 自动调整 + 用户确认
 ```
+## 🔗 作品链接
 
+- 🎬 演示视频：
+  - [ScreenApp 演示视频](https://screenapp.io/app/v/6szR0X9y_C)
+  - [小红书演示视频](http://xhslink.com/o/16A1nVGziq7)
+
+- 🚀 在线 Demo：[CHWL Agent Demo](https://chwl-agent.vercel.app/)
+
+- 📄 设计文档：[腾讯文档](https://docs.qq.com/doc/DRkxXcnh4dHBBR29D)
+
+- 💻 GitHub 仓库：[orchidlemon/chwl-agent](https://github.com/orchidlemon/chwl-agent)
 ---
 
 ## 🚀 核心特性
