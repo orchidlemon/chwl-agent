@@ -48,7 +48,7 @@
   - [ScreenApp 演示视频](https://screenapp.io/app/v/6szR0X9y_C)
   - [小红书演示视频](http://xhslink.com/o/16A1nVGziq7)
 
-- 🚀 在线 Demo：[CHWL Agent Demo](https://chwl-agent.vercel.app/)
+- 🚀 在线 Demo（已部署点击打开）：[CHWL Agent Demo](https://chwl-agent.vercel.app/)
 
 - 📄 设计文档：[腾讯文档](https://docs.qq.com/doc/DRkxXcnh4dHBBR29D)
 
