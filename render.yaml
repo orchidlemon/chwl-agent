@@ -1,27 +1,21 @@
 services:
-  # ── Mock API (POI data, weather, queue etc.) ──────────────────────
   - type: web
     name: meituan-mock-api
     env: python
+    plan: free
     rootDir: mock_api
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
-    envVars:
-      - key: PORT
-        generateValue: false
 
-  # ── Agent Backend (LLM planning, SSE streaming) ───────────────────
   - type: web
     name: meituan-agent
     env: python
+    plan: free
     buildCommand: pip install -r backend/requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: PORT
-        generateValue: false
       - key: MOCK_API_URL
         value: https://meituan-mock-api.onrender.com
-      # ↓ 在 Render Dashboard 手动填入，不写在这里
       - key: LLM_PROVIDER
         sync: false
       - key: DEEPSEEK_API_KEY
