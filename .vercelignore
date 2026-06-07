@@ -1,0 +1,7 @@
+backend/
+mock_api/
+rules/
+tools/
+*.py
+requirements*.txt
+render.yaml
