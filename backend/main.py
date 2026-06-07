@@ -83,6 +83,11 @@ async def reset_session(session_id: str):
     await orchestrator.stop_background_watch(session_id)
     await orchestrator.cancel_confirmations(session_id)
     manager.reset(session_id)
+    try:
+        from backend.state_writer import clear_state
+        clear_state(session_id)
+    except Exception:
+        logger.warning("Failed to clear frontend state for %s", session_id, exc_info=True)
     return {"status": "reset", "session_id": session_id}
 
 
@@ -115,7 +120,7 @@ async def chat(session_id: str, req: ChatRequest):
     even when session was reset (e.g. dev reload).
     """
     _, session = manager.get_or_create(session_id)
-    if req.client_itinerary and not manager.get_itinerary(session_id):
+    if req.client_itinerary and (req.phase_hint == "route_replan" or not manager.get_itinerary(session_id)):
         manager.set_itinerary(session_id, req.client_itinerary)
         session["phase"] = "monitoring"
         manager.add_monitor_event(
@@ -362,6 +367,59 @@ async def simulator_inject(session_id: str, req: InjectEventTextRequest):
         raise HTTPException(404, "Session not found")
     result = await orchestrator.run_simulator_inject(session_id, req.text)
     return result
+
+
+# ── Frontend State (临时 JSON 文件，前端唯一数据源) ─────────────────────
+
+@app.get("/agent/{session_id}/state")
+async def get_state(session_id: str):
+    """
+    返回前端渲染所需的完整状态。
+    前端不维护本地业务状态，所有渲染数据从此接口拉取。
+    数据由 backend/state_writer.py 写入临时 JSON 文件，此处直接返回。
+    """
+    from backend.state_writer import read_state
+    state = read_state(session_id)
+    if not state.get("session_id"):
+        manager.get_or_create(session_id)
+        state["session_id"] = session_id
+    return state
+
+
+@app.get("/agent/{session_id}/state/itinerary")
+async def get_state_itinerary(session_id: str):
+    """只返回行程节点，用于局部刷新。"""
+    from backend.state_writer import read_state
+    state = read_state(session_id)
+    return state.get("itinerary", {"summary": "", "cot": [], "nodes": []})
+
+
+@app.get("/agent/{session_id}/state/monitor")
+async def get_state_monitor(session_id: str):
+    """返回监控面板数据（天气/队列/告警），支持前端定时轮询。"""
+    from backend.state_writer import read_state, update_monitor
+    from backend import tools as _tools
+    import asyncio as _asyncio
+
+    state = read_state(session_id)
+    nodes = state.get("itinerary", {}).get("nodes", [])
+    rest_ids = [n.get("poiId", "") for n in nodes if n.get("type") == "restaurant" and n.get("poiId")]
+
+    live_weather, *queue_results = await _asyncio.gather(
+        _tools.get_weather(),
+        *[_tools.get_queue_status(pid) for pid in rest_ids],
+    )
+    live_queues = {pid: q for pid, q in zip(rest_ids, queue_results)}
+    update_monitor(session_id, weather=live_weather, queue_trends=live_queues)
+    return read_state(session_id).get("monitor", {})
+
+
+@app.get("/agent/{session_id}/state/profile")
+async def get_state_profile(session_id: str):
+    """返回用户画像（LLM 从 NL 提取的信息）。"""
+    from backend.state_writer import read_state
+    state = read_state(session_id)
+    return state.get("user_profile", {})
 
 
 # ── Itinerary read ────────────────────────────────────────────────────

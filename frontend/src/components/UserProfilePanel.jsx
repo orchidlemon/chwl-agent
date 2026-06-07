@@ -140,6 +140,17 @@ export default function UserProfilePanel({ facts, preferences, phase }) {
   const isFriends      = f.scenario === 'friends'
   const hasChildren    = f.has_children || f.has_child
   const hasElderly     = f.has_elderly
+  const childAgeNumber = f.child_age !== undefined && f.child_age !== null ? Number(f.child_age) : null
+  const hasConfirmedMinor = Number.isFinite(childAgeNumber) && childAgeNumber > 0 && childAgeNumber < 18
+  const legalStatus = hasConfirmedMinor
+    ? { icon: '\u274c', label: '\u542b\u672a\u6210\u5e74\u4eba\uff0c\u5df2\u6392\u9664\u996e\u9152\u573a\u6240', warn: true }
+    : f.all_adults_confirmed === true
+      ? { icon: '\u2705', label: '\u5168\u5458\u5df2\u6ee118\u5c81', warn: false }
+      : f.all_adults_confirmed === false
+        ? { icon: '\u274c', label: '\u672a\u786e\u8ba4\u5168\u5458\u6210\u5e74\uff0c\u6682\u4e0d\u5b89\u6392\u996e\u9152\u573a\u6240', warn: true }
+        : hasChildren
+          ? { icon: '\u23f3', label: '\u5b69\u5b50\u5e74\u9f84\u5f85\u786e\u8ba4\uff0c\u6682\u4e0d\u5b89\u6392\u996e\u9152\u573a\u6240', warn: true }
+          : null
 
   // Completeness: base fields + conditional fields
   const baseFields = ['scenario', 'start_time', 'duration_hours', 'companions', 'home_area']
@@ -389,12 +400,12 @@ export default function UserProfilePanel({ facts, preferences, phase }) {
       )}
 
       {/* 18+ legal check */}
-      {f.all_adults_confirmed !== undefined && f.all_adults_confirmed !== null && (
+      {legalStatus && (
         <div className="up-section">
-          <div className="up-section-title">⚖️ 法律确认</div>
-          <div className={`up-badge-card ${f.all_adults_confirmed ? '' : 'up-badge-warn'}`}>
-            <span>{f.all_adults_confirmed ? '✅' : '❌'}</span>
-            <span>{f.all_adults_confirmed ? '全员已满18岁' : '含未成年人，已排除饮酒场所'}</span>
+          <div className="up-section-title">{'\u2696\ufe0f \u6cd5\u5f8b\u786e\u8ba4'}</div>
+          <div className={`up-badge-card ${legalStatus.warn ? 'up-badge-warn' : ''}`}>
+            <span>{legalStatus.icon}</span>
+            <span>{legalStatus.label}</span>
           </div>
         </div>
       )}

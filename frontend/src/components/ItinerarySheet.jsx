@@ -40,7 +40,7 @@ export default function ItinerarySheet({ itinerary, onClose, onShare, onCallTaxi
           ) : (
             <div className="sheet-nodes">
               {nodes.map((node, idx) => {
-                const isDone = node._checked || node.locked
+                const isDone = Boolean(node._checked)
                 return (
                   <React.Fragment key={node.id}>
                     {/* Transit bar BEFORE every node (including first = from home) */}

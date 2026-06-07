@@ -21,7 +21,7 @@ const WELCOME = {
   content: '你好！我是美团本地生活助手 🤖\n\n告诉我你今天想怎么安排，比如：\n「今天下午带老婆孩子出去玩，别太远」\n「和朋友下午一起出去转转」\n\n我会先帮你确认一下出行信息，再给你规划最合适的方案。',
 }
 
-export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate, onProfileUpdate, onNewRoundStart, itinerary, onCheckin, taxiStatus, onTransitChange, onNodeTimeChange, onReplacementSelect, replacementResult }) {
+export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate, onProfileUpdate, onNewRoundStart, itinerary, onCheckin, taxiStatus, onTransitChange, onNodeTimeChange, onReplacementSelect, replacementResult, pendingSimulatorEvent, onSimulatorEventHandled }) {
   const [messages, setMessages]             = useState([WELCOME])
   const [isStreaming, setIsStreaming]        = useState(false)
   const [quickReplies, setQuickReplies]     = useState([])
@@ -92,9 +92,10 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
   useEffect(() => {
     if (itinerary?.length && itinerary.every(n => n._checked || n.completed_lock)) {
       setChatPhase('completed')
-      setQuickReplies([])
+      append({ role: 'agent', type: 'text', content: '🎉 今日行程全部完成！祝出行顺利～\n想开启下一次出行规划，点下方按钮告诉我吧！' })
+      setQuickReplies([{ label: '🆕 开启新规划', action: 'new_round' }])
     }
-  }, [itinerary])
+  }, [itinerary, append])
 
   useEffect(() => {
     if (!replacementResult?.id) return
@@ -121,6 +122,52 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
     }
   }, [replacementResult, itineraryMsgId, append, update])
 
+  // ── Simulator event injection (immediate, no poll delay) ─────────
+  useEffect(() => {
+    if (!pendingSimulatorEvent) return
+    const evt = pendingSimulatorEvent
+    const etype = evt.type || ''
+    if (etype === 'queue_spike') {
+      const matchedNode = itineraryRef.current.find(n =>
+        n.poiId === evt.poi_id || n.poi_id === evt.poi_id
+      )
+      const targetType = evt.target_type || matchedNode?.type
+      const queueTitle = targetType === 'activity' ? '活动排队激增' : '餐厅排队激增'
+      append({
+        role: 'agent', type: 'exception',
+        data: {
+          exception_type: 'queue_spike',
+          title: queueTitle,
+          message: evt.message,
+          original: {
+            id: matchedNode?.id || null,
+            poi_id: evt.poi_id,
+            name: matchedNode?.name || evt.poi_id || '餐厅',
+          },
+          alternative: null,
+        },
+      })
+    } else if (etype === 'weather_heavy_rain') {
+      append({
+        role: 'agent', type: 'exception',
+        data: {
+          exception_type: 'weather_heavy_rain',
+          title: '天气预警',
+          message: evt.message,
+          original: null,
+          alternative: null,
+        },
+      })
+    } else {
+      append({
+        role: 'agent', type: 'monitor_alert',
+        severity: evt.severity || 'medium',
+        content: evt.message,
+      })
+    }
+    onSimulatorEventHandled?.()
+  }, [pendingSimulatorEvent, append, onSimulatorEventHandled])
+
   // ── Monitor polling ───────────────────────────────────────────────
 
   const startMonitorPolling = useCallback(() => {
@@ -146,12 +193,14 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
           const matchedNode = itineraryRef.current.find(n =>
             n.id === evt.node_id || n.poiId === evt.poi_id || n.poi_id === evt.poi_id
           )
+          const targetType = evt.target_type || matchedNode?.type
+          const queueTitle = targetType === 'activity' ? '活动排队激增' : '餐厅排队激增'
           append({
             role: 'agent', type: 'exception',
             data: {
               request_id: evt.request_id,
               exception_type: 'queue_spike',
-              title: '餐厅排队突发拥堵',
+              title: queueTitle,
               message: evt.message,
               original: {
                 id: matchedNode?.id || evt.node_id,
@@ -205,6 +254,31 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
       }
     }
   }, [])
+
+  const refreshBackendState = useCallback(async () => {
+    if (!sessionId) return
+    const state = await api.getState(sessionId)
+    if (!state) return
+
+    const nodes = state.itinerary?.nodes || []
+    if (nodes.length) {
+      if (onItineraryUpdate) onItineraryUpdate(nodes)
+      if (itineraryMsgId) {
+        update(itineraryMsgId, m => ({ ...m, nodes }))
+      } else {
+        appendRouteCardOnce(nodes, `state:${routeSignature(nodes)}`, state.itinerary?.summary || '')
+      }
+    }
+
+    const profile = state.user_profile || {}
+    if (onProfileUpdate && (profile.session_facts || profile.confirmed_preferences)) {
+      onProfileUpdate({
+        facts: profile.session_facts,
+        preferences: profile.confirmed_preferences,
+        phase: state.phase || chatPhase,
+      })
+    }
+  }, [sessionId, onItineraryUpdate, onProfileUpdate, itineraryMsgId, update, appendRouteCardOnce, chatPhase])
 
   // ── Chat flow (phase-aware) ───────────────────────────────────────
 
@@ -315,6 +389,7 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
           appendRouteCardOnce(readyNodes, `ready:${routeSignature(readyNodes)}`, evt.summary || '')
           if (onItineraryUpdate) onItineraryUpdate(evt.nodes || [])
           if (onProfileUpdate && (evt.facts || evt.preferences)) onProfileUpdate({ facts: evt.facts, preferences: evt.preferences, phase: evt.phase || 'monitoring' })
+          setChatPhase('monitoring')
           append({
             role: 'agent', type: 'text',
             content: `行程规划好了 👆\n${evt.summary || ''}\n\n想改什么直接告诉我，比如：\n「把餐厅换成川菜」「出发时间改成下午3点」\n\n或者点「一键安排」直接预约。`,
@@ -372,11 +447,12 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
           append({ role: 'agent', type: 'text', content: `出了点问题：${evt.message}，请重试。` })
           break
       }
-    }, opts).finally(() => {
+    }, opts).finally(async () => {
+      await refreshBackendState()
       clearTyping()
       setIsStreaming(false)
     })
-  }, [sessionId, isStreaming, append, update, removeMsg, startMonitorPolling, appendRouteCardOnce, onProfileUpdate, onItineraryUpdate, chatPhase])
+  }, [sessionId, isStreaming, append, update, removeMsg, startMonitorPolling, appendRouteCardOnce, onProfileUpdate, onItineraryUpdate, chatPhase, refreshBackendState])
 
   // ── Fulfillment flow ──────────────────────────────────────────────
 
@@ -425,8 +501,11 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
           append({ role: 'agent', type: 'text', content: `履约出错：${evt.message}` })
           break
       }
-    }).finally(() => setIsStreaming(false))
-  }, [sessionId, isStreaming, append, update, startMonitorPolling])
+    }).finally(async () => {
+      await refreshBackendState()
+      setIsStreaming(false)
+    })
+  }, [sessionId, isStreaming, append, update, startMonitorPolling, refreshBackendState])
 
   // ── Exception confirm ─────────────────────────────────────────────
 
@@ -469,6 +548,7 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
           }))
           const newNodes = evt.nodes
           if (newNodes?.length > 0) {
+            appendedRouteCardRef.current = null
             appendRouteCardOnce(
               newNodes,
               `exception:${exceptionData.request_id || exceptionData.original?.id || routeSignature(newNodes)}`,
@@ -480,8 +560,11 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
           break
         }
       }
-    }).finally(() => setIsStreaming(false))
-  }, [sessionId, isStreaming, itineraryMsgId, append, update, appendRouteCardOnce, onItineraryUpdate])
+    }).finally(async () => {
+      await refreshBackendState()
+      setIsStreaming(false)
+    })
+  }, [sessionId, isStreaming, itineraryMsgId, append, update, appendRouteCardOnce, onItineraryUpdate, refreshBackendState])
 
   const dismissException = useCallback(async (exceptionData) => {
     if (!sessionId) return
@@ -604,13 +687,12 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
         runFulfill()
         break
       case 'replan':
-        append({ role: 'user', type: 'text', content: '重新规划一个方案' })
-        setItineraryMsgId(null)
+        append({ role: 'user', type: 'text', content: '重新规划路线' })
         appendedRouteCardRef.current = null
-        if (onItineraryUpdate) onItineraryUpdate([])
-        onNewRoundStart?.()
-        setChatPhase('gathering')
-        runChat('重新规划', { phase_hint: 'new_round' })
+        runChat('重新规划路线', {
+          phase_hint: 'route_replan',
+          client_itinerary: itinerary,
+        })
         break
       case 'report':
         append({
@@ -624,8 +706,12 @@ export default function ChatPage({ sessionId, onMonitorUpdate, onItineraryUpdate
         setChatPhase('completed')
         setQuickReplies([])
         break
+      case 'new_round':
+        append({ role: 'agent', type: 'text', content: '好的！请告诉我新一轮的出行需求～' })
+        setQuickReplies([])
+        break
     }
-  }, [runFulfill, runChat, append, originalRequest, onItineraryUpdate, onNewRoundStart])
+  }, [runFulfill, runChat, append, originalRequest, itinerary])
 
   // ── render ────────────────────────────────────────────────────────
 

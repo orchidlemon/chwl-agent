@@ -162,6 +162,58 @@ export async function getMemory(sessionId) {
   return r.json()
 }
 
+// ── State (前端唯一数据源，后端 state_writer 写入，前端拉取渲染) ────────
+
+/**
+ * 拉取完整 session 状态（itinerary + user_profile + monitor + planning_log）
+ * 前端在以下时机调用：
+ *   1. SSE 流结束后（规划完成/重规划完成）
+ *   2. 节点操作（删除/替换/打卡）后
+ *   3. 页面首次加载时
+ */
+export async function getState(sessionId) {
+  try {
+    const r = await fetch(`${BASE}/${sessionId}/state`)
+    if (!r.ok) return null
+    return r.json()
+  } catch (_) {
+    return null
+  }
+}
+
+/** 只拉行程节点，用于局部刷新 */
+export async function getItineraryState(sessionId) {
+  try {
+    const r = await fetch(`${BASE}/${sessionId}/state/itinerary`)
+    if (!r.ok) return null
+    return r.json()
+  } catch (_) {
+    return null
+  }
+}
+
+/** 拉取监控面板数据（含实时队列/天气），支持定时轮询 */
+export async function getMonitorStateV2(sessionId) {
+  try {
+    const r = await fetch(`${BASE}/${sessionId}/state/monitor`)
+    if (!r.ok) return null
+    return r.json()
+  } catch (_) {
+    return null
+  }
+}
+
+/** 拉取用户画像（LLM 从 NL 提取的信息） */
+export async function getUserProfile(sessionId) {
+  try {
+    const r = await fetch(`${BASE}/${sessionId}/state/profile`)
+    if (!r.ok) return null
+    return r.json()
+  } catch (_) {
+    return null
+  }
+}
+
 // ── Monitor state (poll for real-time updates) ────────────────────────
 
 export async function getMonitorState(sessionId) {

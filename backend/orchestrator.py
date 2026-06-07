@@ -93,6 +93,11 @@ class Orchestrator:
             phase = self.manager.get_phase(session_id)
             session = self.manager.get(session_id) or {}
 
+        if phase_hint == "route_replan":
+            async for evt in self._run_route_replan(session_id, message):
+                yield evt
+            return
+
         # Pending exception has priority over ordinary planning/chat routes.
         pending_exception = session.get("pending_exception")
         if pending_exception and phase in ("monitoring", "needs_replan") and phase_hint != "start_plan":
@@ -439,9 +444,9 @@ class Orchestrator:
     def _required_missing_message(self, missing: list[str]) -> str:
         parts = []
         if "child_age" in missing:
-            parts.append("孩子大概几岁")
+            questions.append("1. 孩子大概几岁呀？")
         if "child_purpose" in missing:
-            parts.append("这次更偏科普学习（博物馆/科技馆），还是纯粹好玩")
+            questions.append(f"{len(questions) + 1}. 这次是想带孩子涨知识（科博馆类）还是纯粹好玩就好？")
         if not parts:
             return "还需要补充一点关键信息后再规划。"
         return "先确认一下：" + "？".join(parts) + "？"
@@ -471,10 +476,24 @@ class Orchestrator:
 
         questions = []
         if "child_age" in missing:
-            questions.append("1️⃣ 孩子大概几岁呀？")
+            questions.append("1. 孩子大概几岁呀？")
         if "child_purpose" in missing:
-            questions.append(f"{len(questions) + 1}️⃣ 这次是想带孩子涨知识（科博馆类）还是纯粹好玩就好？")
-        questions.append(f"{len(questions) + 1}️⃣ 出发地对吗？还是从别的地方走？")
+            questions.append(f"{len(questions) + 1}. 这次是想带孩子涨知识（科博馆类）还是纯粹好玩就好？")
+        if "gender_composition" in missing:
+            questions.append(f"{len(questions) + 1}. 男生女生各几个？")
+        if "friends_activity_type" in missing:
+            questions.append(f"{len(questions) + 1}. 大家更想玩哪类活动？社交互动型、剧本杀/密室、桌游吧、文化展览，还是都可以？")
+        if "venue_preference" in missing:
+            questions.append(f"{len(questions) + 1}. 有特别的场地偏好吗？比如室内/户外/商场，或想吃的菜系？")
+        if "female_weight_loss" in missing:
+            questions.append(f"{len(questions) + 1}. 女生需要减脂/健康餐选项吗？")
+        if "female_prefer_low_intensity" in missing:
+            questions.append(f"{len(questions) + 1}. 女生是否偏好低体力活动？")
+        if "female_prefer_indoor" in missing:
+            questions.append(f"{len(questions) + 1}. 女生是否更偏好室内？")
+        if "male_prefer_high_intensity" in missing:
+            questions.append(f"{len(questions) + 1}. 男生是否偏好高强度活动？")
+        questions.append(f"{len(questions) + 1}. 出发地对吗？还是从别的地方走？")
         lines.append("\n还有几个小问题帮我搞清楚：")
         lines.extend(questions)
 
@@ -496,9 +515,25 @@ class Orchestrator:
             updated["companions"] = companions
             updated["child_confirmed_by_user"] = True
         if "child_age" in missing:
-            updated["child_age"] = 10
+            questions.append("1. 孩子大概几岁呀？")
         if "child_purpose" in missing:
-            updated["child_purpose"] = "fun"
+            questions.append(f"{len(questions) + 1}. 这次是想带孩子涨知识（科博馆类）还是纯粹好玩就好？")
+        if "gender_composition" in missing:
+            updated.setdefault("male_count", 0)
+            updated.setdefault("female_count", 0)
+            updated["group_gender"] = "unknown"
+        if "friends_activity_type" in missing:
+            updated["friends_activity_type"] = "mixed"
+        if "venue_preference" in missing:
+            updated["venue_preference"] = "indoor"
+        if "female_weight_loss" in missing:
+            updated["female_weight_loss"] = False
+        if "female_prefer_low_intensity" in missing:
+            updated["female_prefer_low_intensity"] = False
+        if "female_prefer_indoor" in missing:
+            updated["female_prefer_indoor"] = False
+        if "male_prefer_high_intensity" in missing:
+            updated["male_prefer_high_intensity"] = False
         return updated
 
     def _message_starts_new_trip(self, message: str) -> bool:
@@ -506,6 +541,42 @@ class Orchestrator:
         companion_markers = ("孩子", "老婆", "老公", "朋友", "爸妈", "父母", "老人", "同事", "同学")
         trip_markers = ("出门玩", "出去玩", "出行", "安排", "规划", "玩一天", "逛逛")
         return any(w in text for w in companion_markers) and any(w in text for w in trip_markers)
+
+    async def _run_route_replan(self, session_id: str, message: str) -> AsyncGenerator[dict, None]:
+        """Rebuild the route from confirmed needs while excluding every old POI."""
+        memory = self.manager.get_memory(session_id)
+        session_facts = dict(memory.get("session_facts") or {})
+        preferences = dict(memory.get("derived_preferences") or {})
+        old_nodes = list(self.manager.get_itinerary(session_id) or [])
+        exclude_poi_ids = [
+            n.get("poiId") or n.get("poi_id")
+            for n in old_nodes
+            if n.get("poiId") or n.get("poi_id")
+        ]
+        if not session_facts:
+            yield _emit("text", content="还没有可重规划的已确认需求，请先告诉我这次想怎么安排。")
+            yield _emit("done")
+            return
+
+        session_facts["_exclude_poi_ids"] = exclude_poi_ids
+        session_facts["_full_route_replan"] = True
+        self.manager.update_memory(session_id, "session_facts", session_facts)
+        self.manager.set_phase(session_id, "planning")
+        self.manager.add_monitor_event(
+            session_id,
+            "main_agent",
+            f"路线重规划启动：排除 {len(exclude_poi_ids)} 个既有 POI，重新搜索",
+            "route_replan_start",
+        )
+        yield _emit(
+            "confirmed",
+            message="收到，正在避开上一版所有活动/餐厅，重新搜索并重做路线规划。",
+            facts=session_facts,
+            preferences=preferences,
+            phase="planning",
+        )
+        async for evt in self._run_plan_core(session_id, session_facts, preferences):
+            yield evt
 
     async def _run_monitoring_chat(self, session_id: str, message: str) -> AsyncGenerator[dict, None]:
         """Handle user adjustments during monitoring phase."""
@@ -783,10 +854,8 @@ class Orchestrator:
             "distance": f"{float(best.get('distance_km') or 0):.1f}公里",
             "queueMin": queue_min,
             "queueText": f"约{queue_min}分钟" if queue_min > 0 else "无需排队",
-            "price": f"¥{best.get('avg_price', 80)}/位",
             "rating": best.get("rating", old_node.get("rating", 4.5)),
             "tags": tags,
-            "reason": "·".join(reason_bits)[:25] or (best.get("cuisine") or "匹配你的新口味"),
             "poiId": best.get("poi_id", old_node.get("poiId")),
             "booking_urgent": best.get("booking_required", False),
         }
@@ -814,7 +883,7 @@ class Orchestrator:
 
         price = replacement.get("price")
         if not price and replacement.get("avg_price") is not None:
-            price = f"¥{replacement.get('avg_price')}/位"
+            price = f"{int(replacement.get('avg_price') or 0)}元/人"
 
         return {
             **old_node,
@@ -1074,7 +1143,6 @@ class Orchestrator:
             "distance": f"{float(best.get('distance_km') or 0):.1f}公里",
             "queueMin": queue_min,
             "queueText": f"约{queue_min}分钟" if queue_min > 0 else "无需排队",
-            "price": f"¥{best.get('avg_price', 80)}/位",
             "rating": best.get("rating", 4.5),
             "tags": tags,
             "reason": "按你的新需求补充餐厅",
@@ -1297,10 +1365,10 @@ class Orchestrator:
         queue_min = int(candidate.get("queue_min") or old_node.get("queueMin") or 0)
         price = old_node.get("price", "")
         if candidate.get("avg_price") is not None:
-            price = f"¥{candidate.get('avg_price')}/位"
+            price = f"{int(candidate.get('avg_price') or 0)}元/人"
         elif candidate.get("ticket_price") is not None:
             ticket = candidate.get("ticket_price")
-            price = "免费" if not ticket else f"¥{int(ticket)}/位"
+            price = "免费" if ticket == 0 else f"{int(ticket or 0)}元/人"
 
         return {
             **old_node,
@@ -1338,10 +1406,10 @@ class Orchestrator:
         distance_km = _safe_float(candidate.get("distance_km"), 0)
         price = ""
         if candidate.get("avg_price") is not None:
-            price = f"¥{candidate.get('avg_price')}/位"
+            price = f"{int(candidate.get('avg_price') or 0)}元/人"
         elif candidate.get("ticket_price") is not None:
             ticket = candidate.get("ticket_price")
-            price = "免费" if not ticket else f"¥{int(_safe_float(ticket, 0))}/位"
+            price = "免费" if ticket == 0 else f"{int(ticket or 0)}元/人"
         return {
             "poi_id": candidate.get("poi_id") or candidate.get("poiId"),
             "poiId": candidate.get("poi_id") or candidate.get("poiId"),
@@ -1477,6 +1545,7 @@ class Orchestrator:
             food_prefs = [food_prefs]
         cache_session_id = session_facts.get("_session_id") or session_facts.get("session_id")
         cached_items = skills.read_planning_poi_cache(cache_session_id)
+        route_excluded_poi_ids = {str(pid) for pid in (session_facts.get("_exclude_poi_ids") or []) if pid}
 
         for idx, node in enumerate(updated):
             node_type = node.get("type")
@@ -1501,17 +1570,6 @@ class Orchestrator:
                         planned_time=start,
                         planned_end_time=end,
                     )
-                if not candidates:
-                    candidates = self._cached_business_hour_candidates(
-                        cached_items, "activity", None, start, end
-                    )
-                    if not candidates:
-                        candidates = await tools.get_activities(
-                            scenario=scenario,
-                            radius_km=15,
-                            planned_time=start,
-                            planned_end_time=end,
-                        )
             else:
                 candidates = self._cached_business_hour_candidates(
                     cached_items, "activity", category, start, end
@@ -1540,6 +1598,7 @@ class Orchestrator:
                 (
                     cand for cand in candidates
                     if cand.get("poi_id") not in used_poi_ids
+                    and str(cand.get("poi_id") or cand.get("poiId") or "") not in route_excluded_poi_ids
                     and cand.get("open_status") != "closed"
                     and cand.get("availability") != "full"
                     and self._candidate_within_window(cand, start, end)
@@ -1590,7 +1649,7 @@ class Orchestrator:
         existing = self.manager.get_itinerary(session_id)
         pinned_nodes = [
             n for n in existing
-            if n.get("user_pinned") or n.get("pinned")
+            if not session_facts.get("_full_route_replan") and (n.get("user_pinned") or n.get("pinned"))
         ]
         # Pass pinned slot info to planner so LLM avoids those time ranges
         sf_with_pinned = {
@@ -1632,6 +1691,13 @@ class Orchestrator:
                     if text.startswith("🔧"):
                         tool_call_count += 1
                     await asyncio.sleep(0.05)
+
+                elif t == "text":
+                    # Preference note or rule question — forward to frontend as chat text
+                    yield _emit("text", content=item.get("content", ""))
+
+                elif t == "rule_question":
+                    yield _emit("text", content=item.get("content", item.get("message", "")))
 
                 elif t == "tool_error_limit":
                     if _retry < 1:
@@ -1822,6 +1888,12 @@ class Orchestrator:
 
         nodes = self._attach_node_alternatives(session_id, nodes)
         self.manager.set_itinerary(session_id, nodes)
+        if session_facts.get("_exclude_poi_ids") or session_facts.get("_full_route_replan"):
+            clean_facts = {
+                k: v for k, v in session_facts.items()
+                if k not in ("_exclude_poi_ids", "_full_route_replan", "_pinned_nodes", "_session_id")
+            }
+            self.manager.update_memory(session_id, "session_facts", clean_facts)
         self._clear_planning_started(session_id)
         self.manager.set_phase(session_id, "monitoring")
 
@@ -1845,6 +1917,20 @@ class Orchestrator:
                     facts=session_facts,
                     preferences=preferences,
                     phase="monitoring")
+
+        # Start background watch immediately after planning — no need to wait for fulfill
+        watch_configs = build_watch_configs_for_itinerary(nodes)
+        if watch_configs:
+            await self.background_watch.stop_all(session_id)
+            await self.background_watch.start_watch_group(session_id, watch_configs)
+            self.manager.add_monitor_event(
+                session_id, "background_watch",
+                f"已启动 {len(watch_configs)} 个后台监控任务（规划完成后自动启动）", "watch_started"
+            )
+            yield _emit("monitor_started",
+                        message=f"后台监控已就绪，正在监控 {len(watch_configs)} 个变化源",
+                        watch_count=len(watch_configs))
+
         yield _emit("done")
 
     # ── Flow 1: Planning (legacy, still used by /plan endpoint) ──────
@@ -2393,6 +2479,7 @@ class Orchestrator:
             "severity": event.get("severity", "medium"),
             "poi_id": target_poi_id,
             "node_id": target_node.get("id") if target_node else None,
+            "target_type": target_node.get("type") if target_node else None,
         }
 
         return {
@@ -2468,8 +2555,10 @@ def _needs_user_redirect(node: dict) -> bool:
 
 def _redirect_site(node: dict) -> str:
     if node.get("booking_required") or node.get("booking_urgent"):
-        return "美团·预约"
-    return "美团·购票"
+        return "美团预约"
+    if node.get("type") == "restaurant":
+        return "美团排队"
+    return "美团购票"
 
 
 def _action_label(node: dict) -> str:

@@ -118,6 +118,11 @@ class SessionManager:
                 f"阻断非法阶段跳转: {result.from_state} -> {result.requested_state}，fallback={result.to_state}",
                 "phase_fallback",
             )
+        try:
+            from .state_writer import update_phase
+            update_phase(session_id, result.to_state)
+        except Exception:
+            pass
         return result
 
     # Clarify conversation history
@@ -168,6 +173,17 @@ class SessionManager:
             try:
                 from . import skills
                 skills.write_current_itinerary_cache(session_id, nodes)
+            except Exception:
+                pass
+            try:
+                from .state_writer import read_state, update_itinerary
+                current = read_state(session_id).get("itinerary", {})
+                update_itinerary(
+                    session_id,
+                    nodes,
+                    summary=current.get("summary", ""),
+                    cot=current.get("cot", []),
+                )
             except Exception:
                 pass
 
@@ -280,6 +296,7 @@ class SessionManager:
             "type": "queue_spike",
             "severity": "high",
             "poi_id": poi_id,
+            "target_type": "activity" if str(poi_id).startswith("act_") else "restaurant",
             "message": "餐厅排队从18分钟突增到90分钟，可能影响晚餐安排",
             "requires_user_confirmation": True,
         }
@@ -287,6 +304,7 @@ class SessionManager:
         s = self.get(session_id)
         if s:
             s["pending_exception"] = event
+            s["pending_monitor_msg"] = event
         self.update_queue_history(session_id, poi_id, 90)
         self.add_monitor_event(session_id, "sandbox", f"排队突增: {poi_id} -> 90分钟", "queue_spike", poi_id)
         return event
@@ -305,6 +323,7 @@ class SessionManager:
         s = self.get(session_id)
         if s:
             s["pending_exception"] = event
+            s["pending_monitor_msg"] = event
         self.add_monitor_event(session_id, "sandbox", "天气恶化: 大雨预警", "weather_heavy_rain")
         return event
 
@@ -519,6 +538,11 @@ class SessionManager:
             s["booking_warned"] = []
             s["pending_monitor_msg"] = None
             s["clarify_history"] = []
+            try:
+                from .state_writer import clear_state
+                clear_state(session_id)
+            except Exception:
+                pass
 
     def reset_for_next_round(self, session_id: str):
         """Start a fresh planning round while keeping the same browser session."""
@@ -542,6 +566,11 @@ class SessionManager:
         s["booking_warned"] = []
         s["pending_monitor_msg"] = None
         s["clarify_history"] = []
+        try:
+            from .state_writer import clear_state
+            clear_state(session_id)
+        except Exception:
+            pass
         s.setdefault("phase_transition_log", []).append({
             "time": _now_hms(),
             "ok": True,

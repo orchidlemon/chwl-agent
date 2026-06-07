@@ -4,7 +4,7 @@ import MonitorPanel from './components/MonitorPanel'
 import UserProfilePanel from './components/UserProfilePanel'
 import ItinerarySheet from './components/ItinerarySheet'
 import ShareModal from './components/ShareModal'
-import { getOrCreateSession, checkinNode, dispatchTaxi, getUserLocation, updateNodeTime, replaceNode } from './api/agentClient'
+import { getOrCreateSession, checkinNode, dispatchTaxi, getUserLocation, updateNodeTime, replaceNode, getState } from './api/agentClient'
 import './styles.css'
 
 export default function App() {
@@ -22,6 +22,7 @@ export default function App() {
   const [replacementPending, setReplacementPending] = useState(null)
   const [replacementResult, setReplacementResult] = useState(null)
   const [replacementBusy, setReplacementBusy] = useState(false)
+  const [pendingSimulatorEvent, setPendingSimulatorEvent] = useState(null)
 
   useEffect(() => {
     getOrCreateSession().then(setSessionId)
@@ -39,6 +40,24 @@ export default function App() {
       }))
     })
   }, [])
+
+  useEffect(() => {
+    if (!sessionId) return
+    getState(sessionId).then(state => {
+      if (!state) return
+      if (state.itinerary?.nodes?.length) {
+        updateItinerary(state.itinerary.nodes)
+      }
+      const profile = state.user_profile || {}
+      if (profile.session_facts || profile.confirmed_preferences) {
+        setUserProfile({
+          facts: profile.session_facts || null,
+          preferences: profile.confirmed_preferences || null,
+          phase: state.phase || 'gathering',
+        })
+      }
+    })
+  }, [sessionId, updateItinerary])
 
   const handleCheckin = useCallback(async (nodeId) => {
     if (!sessionId) return
@@ -225,6 +244,8 @@ export default function App() {
           onNodeTimeChange={handleNodeTimeChange}
           onReplacementSelect={handleReplacementSelect}
           replacementResult={replacementResult}
+          pendingSimulatorEvent={pendingSimulatorEvent}
+          onSimulatorEventHandled={() => setPendingSimulatorEvent(null)}
         />
 
         {/* Floating transit confirm bar */}
@@ -295,6 +316,17 @@ export default function App() {
         <MonitorPanel
           sessionId={sessionId}
           monitorState={monitorState}
+          onSimulatorAdvance={result => {
+            if (result?.event) {
+              const evt = result.event
+              setPendingSimulatorEvent({
+                type: evt.event_type || 'custom',
+                message: evt.message || result.agent_dialogue || '模拟事件已触发',
+                severity: evt.severity || 'medium',
+                poi_id: evt.target_poi_id || null,
+              })
+            }
+          }}
         />
       )}
     </div>

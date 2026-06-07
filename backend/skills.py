@@ -701,6 +701,13 @@ def _self_gender_explicit(message: str) -> bool:
     return any(marker in (message or "") for marker in _SELF_MARKERS)
 
 
+def _adult_status_explicit(message: str) -> bool:
+    text = message or ""
+    adult_markers = ("\u90fd\u6210\u5e74", "\u5168\u6210\u5e74", "\u5168\u5458\u6210\u5e74", "\u6ee118", "\u6ee1 18", "\u6210\u5e74\u4eba", "\u6ca1\u6709\u672a\u6210\u5e74", "\u65e0\u672a\u6210\u5e74")
+    minor_markers = ("\u672a\u6210\u5e74", "\u5c0f\u5b69", "\u5b69\u5b50", "\u5a03", "\u5c0f\u670b\u53cb", "\u513f\u5b50", "\u5973\u513f")
+    return any(w.encode("utf-8").decode("unicode_escape") in text for w in adult_markers + minor_markers)
+
+
 def _sanitize_identity_fields(facts: dict, user_message: str = "") -> dict:
     """Remove the user from companions/gender counts unless self gender is explicit."""
     clean = dict(facts or {})
@@ -712,10 +719,32 @@ def _sanitize_identity_fields(facts: dict, user_message: str = "") -> dict:
         clean["companions"] = []
 
     msg = user_message or ""
-    if any(w in msg for w in _OWNER_ALIASES["spouse"]) and "spouse" not in clean["companions"]:
+    spouse_mentioned = any(w in msg for w in _OWNER_ALIASES["spouse"])
+    child_mentioned = any(w in msg for w in _CHILD_MARKERS)
+    family_mentioned = spouse_mentioned or child_mentioned
+    friend_mentioned = any(w in msg for w in ('朋友', '同事', '同学', '哥们', '闺蜜', '搭子'))
+    additive_context = any(w in msg for w in ('也', '再', '加上', '还有', '一起带', '顺便'))
+
+    if friend_mentioned and not family_mentioned and not additive_context:
+        clean["scenario"] = "friends"
+        clean["companions"] = ["friends"]
+        clean["has_children"] = False
+        clean["child_age"] = None
+        clean["child_purpose"] = None
+        clean["child_confirmed_by_user"] = False
+        clean["child_age_confirmed_by_user"] = False
+        clean["child_purpose_confirmed_by_user"] = False
+
+    if family_mentioned and not friend_mentioned and not additive_context:
+        clean["companions"] = [c for c in clean["companions"] if c not in ("friend", "friends")]
+        for key in ("friends_activity_type", "male_prefer_high_intensity"):
+            clean.pop(key, None)
+        if clean.get("scenario") == "friends":
+            clean["scenario"] = "family"
+
+    if spouse_mentioned and "spouse" not in clean["companions"]:
         clean["companions"].append("spouse")
 
-    child_mentioned = any(w in msg for w in _CHILD_MARKERS)
     explicit_child_age = _extract_child_age(msg)
     explicit_child_purpose = _infer_child_purpose(msg)
     if child_mentioned:
@@ -767,6 +796,11 @@ def _sanitize_identity_fields(facts: dict, user_message: str = "") -> dict:
     clean["male_count"] = male_count
     clean["female_count"] = female_count
     clean["group_gender"] = "unknown"
+
+    if clean.get("all_adults_confirmed") is False and not _adult_status_explicit(msg):
+        clean["all_adults_confirmed"] = None
+    if explicit_child_age is not None and explicit_child_age < 18:
+        clean["all_adults_confirmed"] = False
     return clean
 
 
@@ -777,6 +811,16 @@ def _child_context_present(facts: dict, message: str = "") -> bool:
         or "child" in companions
         or bool(facts.get("child_age"))
         or any(w in (message or "") for w in _CHILD_MARKERS)
+    )
+
+
+def _friend_context_present(facts: dict, message: str = "") -> bool:
+    companions = facts.get("companions") or []
+    return (
+        facts.get("scenario") == "friends"
+        or "friends" in companions
+        or "friend" in companions
+        or any(w in (message or "") for w in ("朋友", "同事", "同学", "哥们", "闺蜜", "搭子"))
     )
 
 
@@ -803,11 +847,42 @@ def _extract_child_age(text: str = "") -> int | None:
 
 def required_missing_fields(facts: dict, message: str = "") -> list[str]:
     missing = []
+    f = facts or {}
     if _child_context_present(facts or {}, message):
-        if not _has_value((facts or {}).get("child_age")):
+        if not _has_value(f.get("child_age")):
             missing.append("child_age")
-        if not _has_value((facts or {}).get("child_purpose")):
+        if not _has_value(f.get("child_purpose")):
             missing.append("child_purpose")
+    try:
+        male_count = int(f.get("male_count") or 0)
+    except (TypeError, ValueError):
+        male_count = 0
+    try:
+        female_count = int(f.get("female_count") or 0)
+    except (TypeError, ValueError):
+        female_count = 0
+    female_context = (
+        female_count > 0
+        or f.get("group_gender") in ("mixed", "all_female")
+        or any(w in (message or "") for w in ("女生", "女孩", "女朋友", "老婆", "妻子", "媳妇"))
+    )
+    if female_context and f.get("female_weight_loss") is None:
+        missing.append("female_weight_loss")
+    if _friend_context_present(f, message):
+        if (not _has_value(f.get("male_count")) and not _has_value(f.get("female_count"))) or (male_count == 0 and female_count == 0):
+            missing.append("gender_composition")
+        if not _has_value(f.get("friends_activity_type")):
+            missing.append("friends_activity_type")
+        if not _has_value(f.get("venue_preference")):
+            missing.append("venue_preference")
+        if f.get("female_weight_loss") is None and "female_weight_loss" not in missing:
+            missing.append("female_weight_loss")
+        if f.get("female_prefer_low_intensity") is None:
+            missing.append("female_prefer_low_intensity")
+        if f.get("female_prefer_indoor") is None:
+            missing.append("female_prefer_indoor")
+        if f.get("male_prefer_high_intensity") is None:
+            missing.append("male_prefer_high_intensity")
     return missing
 
 
@@ -832,12 +907,26 @@ def enforce_required_clarifications(result: dict, message: str = "") -> dict:
         if field not in missing:
             missing.append(field)
 
-    if "child_age" in missing or "child_purpose" in missing:
+    if missing:
         question_parts = []
         if "child_age" in missing:
             question_parts.append("孩子大概几岁")
         if "child_purpose" in missing:
             question_parts.append("这次更偏科普学习（博物馆/科技馆）还是纯粹好玩")
+        if "gender_composition" in missing:
+            question_parts.append("朋友里男生女生各几人")
+        if "friends_activity_type" in missing:
+            question_parts.append("大家更想玩哪类活动：社交互动、文化展览、逛街购物、出片打卡，还是混搭")
+        if "venue_preference" in missing:
+            question_parts.append("有没有特别场地偏好：室内、户外、商场，还是无所谓")
+        if "female_weight_loss" in missing:
+            question_parts.append("女生需要健康餐/低卡选项吗")
+        if "female_prefer_low_intensity" in missing:
+            question_parts.append("女生是否偏好低体力活动")
+        if "female_prefer_indoor" in missing:
+            question_parts.append("女生是否更偏室内")
+        if "male_prefer_high_intensity" in missing:
+            question_parts.append("男生是否偏好高强度运动")
         followup = "另外我需要确认：" + "？".join(question_parts) + "？"
         msg = str(fixed.get("confirm_message") or "").strip()
         if followup not in msg:
@@ -953,12 +1042,20 @@ def build_confirmed_requirements(facts: dict, preferences: dict) -> list[str]:
         scenario = f.get("scenario", "")
         label = "朋友构成" if scenario == "friends" else "同行性别"
         lines.append(f"{label}：男{male_count}人、女{female_count}人")
+    if female_count and f.get("female_weight_loss") is not None:
+        lines.append("女生餐食：" + ("需要健康餐/低卡选项" if f.get("female_weight_loss") else "无健康餐/低卡要求"))
     if f.get("friends_activity_type"):
         fat = {
             "social": "社交互动", "exhibition": "文化展览",
             "mall": "逛街购物", "photo_spot": "出片打卡", "mixed": "综合体验",
         }.get(f["friends_activity_type"], f["friends_activity_type"])
         lines.append(f"活动偏好：{fat}")
+    if f.get("female_prefer_low_intensity") is not None:
+        lines.append("女生体力偏好：" + ("低体力活动" if f.get("female_prefer_low_intensity") else "无低体力限制"))
+    if f.get("female_prefer_indoor") is not None:
+        lines.append("女生场地偏好：" + ("室内优先" if f.get("female_prefer_indoor") else "室内外皆可"))
+    if f.get("male_prefer_high_intensity") is not None:
+        lines.append("男生强度偏好：" + ("可接受高强度运动" if f.get("male_prefer_high_intensity") else "不特别追求高强度"))
 
     participant_preferences = f.get("participant_preferences") or {}
     for owner in ("spouse", "self"):
@@ -1012,7 +1109,10 @@ def enforce_planning_tool_args(name: str,
                                preferences: dict) -> dict:
     """Force confirmed user demands into search tool parameters."""
     patched = dict(args or {})
-    if name == "search_restaurants":
+    if name in ("search_restaurants", "search_restaurant"):
+        excluded_poi_ids = list(session_facts.get("_exclude_poi_ids") or [])
+        if excluded_poi_ids and not patched.get("exclude_poi_ids"):
+            patched["exclude_poi_ids"] = excluded_poi_ids
         start_time = session_facts.get("start_time") or "14:00"
         if not patched.get("planned_time"):
             patched["planned_time"] = start_time
@@ -1024,8 +1124,16 @@ def enforce_planning_tool_args(name: str,
         if food:
             existing = [p.strip() for p in str(patched.get("preferences", "")).split(",") if p.strip()]
             patched["preferences"] = ",".join(_append_unique(existing, list(food)))
+        if session_facts.get("female_weight_loss"):
+            require_tags = list(patched.get("require_tags") or [])
+            if "healthy_options" not in require_tags:
+                require_tags.append("healthy_options")
+            patched["require_tags"] = require_tags
 
-    if name == "search_activities":
+    if name in ("search_activities", "search_activity"):
+        excluded_poi_ids = list(session_facts.get("_exclude_poi_ids") or [])
+        if excluded_poi_ids and not patched.get("exclude_poi_ids"):
+            patched["exclude_poi_ids"] = excluded_poi_ids
         start_time = session_facts.get("start_time") or "14:00"
         if not patched.get("planned_time"):
             patched["planned_time"] = start_time
@@ -1034,7 +1142,10 @@ def enforce_planning_tool_args(name: str,
             if planned_end:
                 patched["planned_end_time"] = planned_end
         venue = preferences.get("venue") or session_facts.get("venue_preference")
+        if session_facts.get("female_prefer_indoor"):
+            venue = "indoor"
         activity_pref = session_facts.get("activity_preference")
+        friends_activity_type = session_facts.get("friends_activity_type")
         categories = [c.strip() for c in str(patched.get("categories", "")).split(",") if c.strip()]
         category_map = {
             "mall": ["mall_exhibition"],
@@ -1043,16 +1154,22 @@ def enforce_planning_tool_args(name: str,
             "park": ["outdoor_park"],
             "exhibition": ["museum", "exhibition"],
             "citywalk": ["citywalk"],
-            "social": ["board_game"],
+            "social": ["script_kill", "escape_room", "board_game"],
+            "photo_spot": ["citywalk", "landmark", "art_installation"],
             "playground": ["indoor_playground"],
         }
         forced = []
+        if friends_activity_type in category_map:
+            forced.extend(category_map[friends_activity_type])
         if activity_pref in category_map:
             forced.extend(category_map[activity_pref])
         elif venue in category_map:
             forced.extend(category_map[venue])
         if forced:
             patched["categories"] = ",".join(_append_unique(categories, forced))
+        if session_facts.get("female_prefer_low_intensity"):
+            exclude_tags = list(patched.get("exclude_tags") or [])
+            patched["exclude_tags"] = _append_unique(exclude_tags, ["high_intensity", "hiking", "mountain_hiking"])
 
     return patched
 
@@ -1350,7 +1467,8 @@ async def _call_json_with_retry(system: str, user: str, model_alias: str,
 
 async def _call_llm_with_tools(messages: list, tools: list,
                                 model_alias: str = "fast_model",
-                                max_tokens: int = 4096) -> dict:
+                                max_tokens: int = 4096,
+                                tool_choice: str = "required") -> dict:
     """
     Call LLM with tool definitions. Returns unified result:
     {
@@ -1371,7 +1489,7 @@ async def _call_llm_with_tools(messages: list, tools: list,
             model=_resolve_model(model_alias),
             messages=messages,
             tools=tools,
-            tool_choice="required",   # force tool use; finish_planning serves as the exit
+            tool_choice=tool_choice,
             max_tokens=max_tokens,
         )
         try:
@@ -1418,12 +1536,13 @@ async def _call_llm_with_tools(messages: list, tools: list,
 
     from . import agent_tools as _at
     ant_tools = _at.to_anthropic_tools(tools)
+    ant_tool_choice = {"type": "auto"} if tool_choice == "auto" else {"type": "any"}
 
     resp = await client.messages.create(
         model=_resolve_model(model_alias),
         messages=messages,
         tools=ant_tools,
-        tool_choice={"type": "any"},  # "any" forces tool use in Anthropic API
+        tool_choice=ant_tool_choice,
         max_tokens=max_tokens,
     )
 
@@ -1496,7 +1615,17 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
     Falls back to non-tool plan_itinerary() if no API key or tool loop fails.
     """
     import time as _time
-    from . import agent_tools as _at
+    import sys as _sys
+    import os as _os
+    _project_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _project_root not in _sys.path:
+        _sys.path.insert(0, _project_root)
+    from tools import server as _tool_server
+    from backend.state_writer import (
+        update_phase, update_itinerary, update_user_profile,
+        append_rule_call, append_cot_step,
+    )
+    session_id = session_facts.get("_session_id") or session_facts.get("session_id")
 
     if not _has_api_key():
         # Fallback: old non-tool approach
@@ -1508,6 +1637,14 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
             {"session_facts": session_facts, "preferences": preferences},
             "full_managed",
         )
+        if session_id:
+            update_user_profile(session_id, session_facts, preferences)
+            update_itinerary(
+                session_id,
+                nodes=plan.get("nodes", []),
+                summary=plan.get("summary", ""),
+                cot=plan.get("cot", []),
+            )
         yield {"_type": "result", "plan": plan}
         return
 
@@ -1565,8 +1702,10 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
     # ── Legal / age limits (highest priority) ────────────────────────
     all_adults = session_facts.get("all_adults_confirmed")
     has_minor  = bool(child_age and int(child_age) < 18)
-    if has_minor or all_adults is not True:
-        constraints.append("⚖️【法律最高优先级】未成年人禁酒：绝对禁止安排酒吧、夜店、清吧、任何以饮酒为主题的场所")
+    if has_minor or all_adults is False:
+        constraints.append("⚖️【法律最高优先级】已确认存在未成年人：绝对禁止安排酒吧、夜店、清吧、任何以饮酒为主题的场所")
+    elif all_adults is not True:
+        constraints.append("⚖️【法律最高优先级】尚未确认全员成年：暂不安排酒吧、夜店、清吧、任何以饮酒为主题的场所")
     if child_age:
         ca = int(child_age)
         if 5 <= ca < 14:
@@ -1716,31 +1855,141 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
             "- 节点数量可以为 2-4 个活动节点，不因缺少餐厅而视为不合格"
         )
 
-    system_prompt = prompts.AGENT_PLAN_SYSTEM
-    planning_tools = _at.PLANNING_TOOLS
-    if skip_restaurant:
-        system_prompt = prompts.AGENT_PLAN_SYSTEM + """
+    # ── Rule-Gathering Loop：LLM 主动判断并调用规则工具 ────────────────
+    from backend.prompts.planner import AGENT_PLAN_SYSTEM as _PLAN_SYS
+    from backend.prompts.planner import RULE_GATHER_SYSTEM as _RULE_SYS
 
-## 动态工具约束：用户不需要餐食
-- 跳过 search_restaurants；该工具本轮不可用
-- 跳过 get_queue_status；没有餐厅节点无需查排队
-- finish_planning 的前提改为：已调用 get_weather 和 search_activities，且必要时调用 get_booking_status
-- 行程节点数允许 2-4 个，全部为 activity/light，严禁 restaurant
-"""
-        planning_tools = [
-            json.loads(json.dumps(tool, ensure_ascii=False))
-            for tool in _at.PLANNING_TOOLS
-            if tool.get("function", {}).get("name") not in {"search_restaurants", "get_queue_status"}
+    rule_hard_blocks: list[str] = []
+    rule_constraints: list[str] = []
+    rule_exclude_tags: list[str] = []
+    rule_require_tags: list[str] = []
+    rule_time_hint: dict = {}
+    rule_food_hint: dict = {}
+    rule_applied: list[str] = []
+
+    if session_id:
+        update_phase(session_id, "planning")
+        update_user_profile(session_id, session_facts, preferences)
+
+    try:
+        _rule_user_content = json.dumps({
+            "scenario": scenario,
+            "has_children": session_facts.get("has_children"),
+            "child_age": session_facts.get("child_age"),
+            "has_elderly": session_facts.get("has_elderly"),
+            "companions": session_facts.get("companions", []),
+            "start_time": start_time,
+            "duration_hours": duration_hours,
+            "food_preferences": food_prefs,
+            "skip_restaurant": skip_restaurant,
+            "male_count": session_facts.get("male_count", 0),
+            "female_count": session_facts.get("female_count", 0),
+            "female_weight_loss": session_facts.get("female_weight_loss"),
+            "female_prefer_low_intensity": session_facts.get("female_prefer_low_intensity"),
+            "female_prefer_indoor": session_facts.get("female_prefer_indoor"),
+            "male_prefer_high_intensity": session_facts.get("male_prefer_high_intensity"),
+            "friends_activity_type": session_facts.get("friends_activity_type"),
+            "venue_preference": venue_pref,
+        }, ensure_ascii=False, indent=2)
+        _rule_messages = [
+            {"role": "system", "content": _RULE_SYS},
+            {"role": "user", "content": _rule_user_content},
         ]
-        for tool in planning_tools:
-            fn = tool.get("function", {})
-            if fn.get("name") == "finish_planning":
-                fn["description"] = (
+        _rule_result = await _call_llm_with_tools(
+            _rule_messages,
+            _tool_server.get_rule_tool_schemas(),
+            model_alias="fast_model",
+            max_tokens=2048,
+            tool_choice="auto",  # LLM 自行决定调哪些规则，可以不调
+        )
+        if _rule_result.get("tool_calls"):
+            for _rtc in _rule_result["tool_calls"]:
+                _rname = _rtc["name"]
+                _rargs = _rtc["args"]
+                _rr = await _tool_server.execute_tool(_rname, _rargs)
+                rule_applied.append(_rname)
+                rule_hard_blocks.extend(_rr.get("hard_blocks", []))
+                rule_constraints.extend(_rr.get("constraints", []))
+                _hints = _rr.get("search_filter_hints", {})
+                rule_exclude_tags.extend(_hints.get("exclude_tags", []))
+                rule_require_tags.extend(_hints.get("require_tags", []))
+                if _rname == "check_time_policy":
+                    rule_time_hint = _rr.get("search_params_hint", {})
+                if _rname == "check_food_policy":
+                    rule_food_hint = _rr.get("search_params_hint", {})
+                _rsummary = _tool_server.summarize_tool_result(_rname, _rr)
+                yield {"_type": "cot_step", "text": f"📋 规则检查: {_rname} → {_rsummary}"}
+                for _q in _rr.get("questions_to_ask_user", []):
+                    _question = _q.get("question", "")
+                    yield {
+                        "_type": "rule_question",
+                        "field": _q.get("field"),
+                        "question": _question,
+                        "content": _question,
+                        "priority": _q.get("priority"),
+                    }
+                if session_id:
+                    append_rule_call(session_id, _rname, str(_rargs)[:100], _rsummary)
+    except Exception as _re:
+        logger.warning(f"[AgentPlan] Rule-gathering failed (non-fatal): {_re}")
+
+    if session_id and rule_applied:
+        update_user_profile(
+            session_id,
+            session_facts,
+            preferences,
+            applied_rules=rule_applied,
+        )
+
+    # 将规则结果注入 user_msg
+    _rule_ctx_parts = []
+    if rule_hard_blocks:
+        _rule_ctx_parts.append(f"【LLM规则验证-绝对禁止】: {', '.join(set(rule_hard_blocks))}")
+    if rule_constraints:
+        _rule_ctx_parts.append(f"【LLM规则验证-约束】: {'; '.join(rule_constraints)}")
+    if rule_exclude_tags:
+        _rule_ctx_parts.append(
+            f"【搜索排除标签(来自规则)】: {json.dumps(list(set(rule_exclude_tags)), ensure_ascii=False)}"
+        )
+    if rule_require_tags:
+        _rule_ctx_parts.append(
+            f"【搜索必须标签(来自规则)】: {json.dumps(list(set(rule_require_tags)), ensure_ascii=False)}"
+        )
+    if rule_time_hint.get("planned_time"):
+        _rule_ctx_parts.append(
+            f"【规则推荐搜索时间】: planned_time={rule_time_hint['planned_time']}"
+            f", planned_end_time={rule_time_hint.get('planned_end_time', end_time)}"
+        )
+    if rule_food_hint.get("preferences"):
+        _rule_ctx_parts.append(
+            f"【规则推荐餐饮参数】: preferences={rule_food_hint['preferences']}"
+            f", require_tags={rule_food_hint.get('require_tags', [])}"
+        )
+    if _rule_ctx_parts:
+        user_msg += "\n\n## 规则工具验证结果（直接使用，无需再调规则工具）\n" + "\n".join(_rule_ctx_parts)
+
+    # ── 规划工具（仅数据工具，规则工具不再暴露给规划 LLM）────────────────
+    system_prompt = _PLAN_SYS
+    planning_tools = _tool_server.get_planning_tool_schemas()
+    if skip_restaurant:
+        system_prompt = _PLAN_SYS + """
+
+## 动态约束：用户不需要餐食
+- 跳过 search_restaurant；该工具本轮不可用
+- 跳过 check_queue；没有餐厅节点无需查排队
+- finish_planning 前提改为：已调用 check_weather 和 search_activity
+- 节点数允许 2-4 个，全部为 activity/light，严禁 restaurant 节点
+"""
+        planning_tools = _tool_server.get_planning_tool_schemas(
+            exclude_names={"search_restaurant", "check_queue"}
+        )
+        for _pt in planning_tools:
+            _pfn = _pt.get("function", {})
+            if _pfn.get("name") == "finish_planning":
+                _pfn["description"] = (
                     "收集足够数据后调用此工具提交最终行程方案。"
-                    "【前提】用户不需要餐食，本轮只需已调用 get_weather 和 search_activities，"
-                    "必要时调用 get_booking_status。"
-                    "【约束】nodes 中每个 poiId 必须来自工具返回的真实数据，严禁编造；"
-                    "严禁 restaurant 节点。"
+                    "【前提】用户不需要餐食，只需已调用 check_weather 和 search_activity。"
+                    "nodes 中每个 poiId 必须来自工具返回的真实数据，严禁编造，严禁 restaurant 节点。"
                 )
 
     messages = [
@@ -1751,7 +2000,6 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
     seen_poi_ids:  set[str]        = set()
     seen_poi_data: dict[str, dict] = {}
     seen_poi_ids.add("walk_001")  # always allow walk nodes
-    session_id = session_facts.get("_session_id") or session_facts.get("session_id")
     _write_planning_poi_cache(session_id, seen_poi_data)
     planning_state = {
         "user_context": {"session_facts": session_facts, "preferences": preferences},
@@ -1760,6 +2008,10 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
         "seen_restaurants": [],
         "activity_search_args": {},
         "restaurant_search_args": {},
+        "activity_preference_gaps": [],
+        "restaurant_preference_gaps": [],
+        "restaurant_zero_count": 0,
+        "restaurant_exhausted": False,
         "queue_results": {},
         "booking_results": {},
         "route_results": {},
@@ -1769,16 +2021,20 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
         "route_exec_count": 0,
     }
 
-    MAX_ITERATIONS = 8
+    MAX_ITERATIONS = 15
     consecutive_tool_errors = 0  # counter for auto-replan trigger
     finish_reject_count = 0      # counter for finish_planning ID rejection
 
     for iteration in range(MAX_ITERATIONS):
         logger.info(f"[AgentPlan] iteration={iteration}")
 
+        # Keep restaurant tools available; fallback must stay inside restaurant
+        # search unless the user explicitly skips meals.
+        _active_tools = planning_tools
+
         try:
             result = await _call_llm_with_tools(
-                messages, planning_tools,
+                messages, _active_tools,
                 model_alias="fast_model",
                 max_tokens=4096,
             )
@@ -1839,20 +2095,58 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
                     # Accept: normalize field names and enrich display data from search results
                     enriched = _clamp_nodes_to_day(_enrich_nodes(valid_nodes, seen_poi_data))
                     summary = args.get("summary", "")
-                    no_restaurant_reason = ""
                     if (
                         not skip_restaurant
-                        and not planning_state.get("seen_restaurants")
                         and not any(n.get("type") == "restaurant" or n.get("category") == "restaurant" for n in enriched)
                     ):
-                        no_restaurant_reason = "没有找到满足时间/偏好/营业状态的可用餐厅，已将餐厅时段降级替换为合适活动"
-                        summary = no_restaurant_reason if not summary else f"{summary}；{no_restaurant_reason}"
+                        finish_reject_count += 1
+                        yield {"_type": "cot_step",
+                               "text": "⚠️ 未安排餐厅，继续搜索餐厅候选；只有用户明确不吃才可跳过餐厅"}
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "【系统强约束】本轮 skip_restaurant=false，finish_planning 必须包含餐厅节点。\n"
+                                "请调用 search_restaurant：先放宽健康/低卡等偏好为轻食/沙拉/清淡，仍为空则忽略该偏好找高评分餐厅。"
+                            ),
+                        })
+                        early_finish = True
+                        break
                     plan = {
                         "nodes": enriched,
                         "summary": summary,
-                        "cot":     [*args.get("cot", []), *([no_restaurant_reason] if no_restaurant_reason else [])],
+                        "cot":     list(args.get("cot", [])),
                     }
+
+                    # 偏好未满足说明：合并 LLM 上报 + 工具返回的 preference_gaps
+                    _pref_note = _build_preference_note(
+                        args.get("unmet_preferences", []),
+                        planning_state.get("activity_preference_gaps", []),
+                        planning_state.get("restaurant_preference_gaps", []),
+                    )
+                    if _pref_note:
+                        plan["preference_note"] = _pref_note
+
                     yield {"_type": "cot_step", "text": f"✅ Agent 完成规划：{plan['summary']}"}
+
+                    # 先展示偏好说明，再推送行程
+                    if _pref_note:
+                        yield {"_type": "text", "content": _pref_note}
+
+                    # 写入临时状态文件，前端通过 GET /state 拉取渲染
+                    if session_id:
+                        update_user_profile(
+                            session_id,
+                            session_facts,
+                            preferences,
+                            applied_rules=rule_applied,
+                        )
+                        update_itinerary(
+                            session_id,
+                            nodes=plan.get("nodes", []),
+                            summary=plan.get("summary", ""),
+                            cot=plan.get("cot", []),
+                        )
+                        update_phase(session_id, "monitoring")
                     yield {"_type": "result", "plan": plan}
                     return
 
@@ -1872,6 +2166,14 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
                     if len(auto_plan.get("nodes", [])) >= 2:
                         yield {"_type": "cot_step",
                                "text": f"✅ 自动构建完成：{len(auto_plan['nodes'])} 个节点"}
+                        _pref_note = _build_preference_note(
+                            [],
+                            planning_state.get("activity_preference_gaps", []),
+                            planning_state.get("restaurant_preference_gaps", []),
+                        )
+                        if _pref_note:
+                            auto_plan["preference_note"] = _pref_note
+                            yield {"_type": "text", "content": _pref_note}
                         yield {"_type": "result", "plan": auto_plan}
                         return
 
@@ -1892,12 +2194,20 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
                     planning_state, session_facts, preferences, skip_restaurant
                 )
                 if len(auto_plan.get("nodes", [])) >= 2:
+                    _pref_note = _build_preference_note(
+                        [],
+                        planning_state.get("activity_preference_gaps", []),
+                        planning_state.get("restaurant_preference_gaps", []),
+                    )
+                    if _pref_note:
+                        auto_plan["preference_note"] = _pref_note
+                        yield {"_type": "text", "content": _pref_note}
                     yield {"_type": "result", "plan": auto_plan}
                     return
 
             cached_route = None
             route_hint = ""
-            if name in ("estimate_routes", "route_check"):
+            if name in ("estimate_routes", "estimate_route", "route_check"):
                 sequence_key, set_key = _route_cache_keys(args)
                 cached_route = planning_state["route_results"].get(sequence_key)
                 set_counts = planning_state["route_set_counts"]
@@ -1938,21 +2248,74 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
                             planning_state, session_facts, preferences, skip_restaurant
                         )
                         if len(auto_plan.get("nodes", [])) >= 2:
+                            _pref_note = _build_preference_note(
+                                [],
+                                planning_state.get("activity_preference_gaps", []),
+                                planning_state.get("restaurant_preference_gaps", []),
+                            )
+                            if _pref_note:
+                                auto_plan["preference_note"] = _pref_note
+                                yield {"_type": "text", "content": _pref_note}
                             yield {"_type": "result", "plan": auto_plan}
                             return
                     continue
 
             # Data tool: execute and emit CoT step
-            yield {"_type": "cot_step", "text": f"🔧 调用工具 {name}"}
-            tool_result = await _at.execute_tool(name, args, seen_poi_ids)
-            summary = _at.summarize_tool_result(name, tool_result)
+            # (rule tools no longer appear here — handled in rule-gathering loop above)
+            _RULE_TOOL_NAMES = {"check_age_policy", "check_group_policy",
+                                "check_time_policy", "check_food_policy", "check_itinerary_structure"}
+            is_rule_tool = name in _RULE_TOOL_NAMES
+            icon = "📋" if is_rule_tool else "🔧"
+            yield {"_type": "cot_step", "text": f"{icon} 调用工具 {name}"}
+            tool_result = await _tool_server.execute_tool(name, args, seen_poi_ids)
+            summary = _tool_server.summarize_tool_result(name, tool_result)
             yield {"_type": "cot_step", "text": f"   ↳ {summary}"}
+
+            # 写入状态文件供前端展示
+            if session_id:
+                append_cot_step(session_id, f"{icon} {name}: {summary}")
+                if is_rule_tool:
+                    append_rule_call(
+                        session_id, name,
+                        str(args)[:100],
+                        summary,
+                    )
+                    # 如果规则返回了追问，把追问注入到 CoT 流
+                    questions = tool_result.get("questions_to_ask_user", [])
+                    for q in questions:
+                        question = q.get("question", "")
+                        yield {
+                            "_type": "rule_question",
+                            "field": q.get("field"),
+                            "question": question,
+                            "content": question,
+                            "priority": q.get("priority"),
+                        }
             _update_planning_state(planning_state, name, args, tool_result)
+
+            # Restaurant zero-result circuit breaker
+            if (name in ("search_restaurants", "search_restaurant")
+                    and not planning_state.get("restaurant_exhausted")
+                    and planning_state.get("restaurant_zero_count", 0) >= 2):
+                planning_state["restaurant_exhausted"] = True
+                yield {"_type": "cot_step",
+                       "text": "⚠️ 餐厅连续2次搜索为空，改用餐厅偏好降级搜索，不替换为活动"}
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "【系统提示】附近无符合条件的餐厅，已连续2次搜索均为0结果。\n"
+                        "请继续保留餐厅节点，不要把餐厅替换为活动：\n"
+                        "- 再调用 search_restaurant，并放宽餐厅偏好/require_tags\n"
+                        "- 先找该偏好衍生的相近餐厅；仍为空时忽略该偏好，找其他高评分餐厅\n"
+                        "- 只有 skip_restaurant=true 或用户明确说不吃/不用餐时，才可以跳过餐厅"
+                    ),
+                })
 
             # Track consecutive tool errors (empty results or error keys)
             is_error_result = (
                 "error" in tool_result
-                or (name in ("search_activities", "search_restaurants")
+                or (name in ("search_activities", "search_activity",
+                             "search_restaurants", "search_restaurant")
                     and len(tool_result.get("items", [])) == 0)
             )
             if is_error_result:
@@ -1967,7 +2330,8 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
                 consecutive_tool_errors = 0  # reset on success
 
             # Store full POI data for later enrichment
-            if name in ("search_activities", "search_restaurants"):
+            if name in ("search_activities", "search_activity",
+                        "search_restaurants", "search_restaurant"):
                 for item in tool_result.get("items", []):
                     pid = item.get("poi_id", "")
                     if pid:
@@ -1996,6 +2360,15 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
             {"session_facts": session_facts, "preferences": preferences},
             "full_managed",
         )
+    # 备用路径也输出偏好未满足说明
+    _pref_note = _build_preference_note(
+        [],
+        planning_state.get("activity_preference_gaps", []),
+        planning_state.get("restaurant_preference_gaps", []),
+    )
+    if _pref_note:
+        plan["preference_note"] = _pref_note
+        yield {"_type": "text", "content": _pref_note}
     yield {"_type": "result", "plan": plan}
 
 
@@ -2126,26 +2499,102 @@ def _nearest_route_result(route_results: dict, set_key: tuple) -> dict:
     return next(iter(route_results.values()))
 
 
+def _format_preference_text(value) -> str:
+    if value is None:
+        return ""
+    separator = "\u3001"
+    if isinstance(value, (list, tuple, set)):
+        parts = [_format_preference_text(v) for v in value]
+        return separator.join(part for part in parts if part)
+    text = str(value).strip()
+    if "\\u" in text:
+        try:
+            text = text.encode("utf-8").decode("unicode_escape")
+        except Exception:
+            pass
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            return separator.join(str(v).strip() for v in parsed if str(v).strip())
+    return text.strip('[]').replace('"', '').replace("'", "").strip()
+
+
+def _clean_preference_detail(detail: str, item: str) -> str:
+    detail = _format_preference_text(detail)
+    if item:
+        raw_forms = [f'["{item}"]', f"['{item}']", f"[{item}]"]
+        for raw in raw_forms:
+            detail = detail.replace(raw, item)
+    return detail
+
+
+def _build_preference_note(
+    unmet_from_llm: list[dict],
+    activity_gaps: list[dict],
+    restaurant_gaps: list[dict],
+) -> str:
+    all_items: list[dict] = []
+    seen: set[str] = set()
+
+    for u in (unmet_from_llm or []):
+        item = _format_preference_text(u.get("item"))
+        if item and item.lower() not in seen:
+            all_items.append({"item": item, "message": _clean_preference_detail(u.get("message"), item)})
+            seen.add(item.lower())
+
+    for gap in (activity_gaps or []) + (restaurant_gaps or []):
+        item = _format_preference_text(gap.get("requested"))
+        if item and item.lower() not in seen:
+            detail = _clean_preference_detail(gap.get("detail"), item) or f"\u672a\u627e\u5230{item}"
+            all_items.append({"item": item, "message": detail[:40]})
+            seen.add(item.lower())
+
+    if not all_items:
+        return ""
+
+    messages = []
+    for g in all_items:
+        item = g.get("item", "")
+        message = _clean_preference_detail(g.get("message"), item)
+        if not message and item:
+            message = f"\u8fd9\u6b21\u6682\u65f6\u6ca1\u6709\u627e\u5230\u7b26\u5408{item}\u7684\u9009\u9879"
+        if message:
+            if item and item not in message:
+                message = f"{item}\uff1a{message}"
+            messages.append(message.rstrip("\u3002."))
+    if not messages:
+        return ""
+    return "\u6e29\u99a8\u63d0\u793a\uff1a" + "\uff1b".join(messages[:4]) + "\u3002"
+
 def _update_planning_state(state: dict, name: str, args: dict, result: dict) -> None:
     if not isinstance(result, dict) or "error" in result:
         return
-    if name == "get_weather":
+    if name in ("get_weather", "check_weather"):
         state["weather"] = result
-    elif name == "search_activities":
+    elif name in ("search_activities", "search_activity"):
         state["seen_activities"] = list(result.get("items", []) or [])
         state["activity_search_args"] = dict(args or {})
-    elif name == "search_restaurants":
+        state["activity_preference_gaps"] = list(result.get("preference_gaps", []) or [])
+    elif name in ("search_restaurants", "search_restaurant"):
         state["seen_restaurants"] = list(result.get("items", []) or [])
         state["restaurant_search_args"] = dict(args or {})
-    elif name == "get_queue_status":
+        state["restaurant_preference_gaps"] = list(result.get("preference_gaps", []) or [])
+        if result.get("items"):
+            state["restaurant_zero_count"] = 0  # reset on success
+        else:
+            state["restaurant_zero_count"] = int(state.get("restaurant_zero_count", 0)) + 1
+    elif name in ("get_queue_status", "check_queue"):
         poi_id = args.get("poi_id")
         if poi_id:
             state["queue_results"][poi_id] = result
-    elif name == "get_booking_status":
+    elif name in ("get_booking_status", "check_availability"):
         poi_id = args.get("poi_id")
         if poi_id:
             state["booking_results"][poi_id] = result
-    elif name in ("estimate_routes", "route_check"):
+    elif name in ("estimate_routes", "estimate_route", "route_check"):
         sequence_key, _ = _route_cache_keys(args)
         state["route_results"][sequence_key] = result
         state["route_exec_count"] = int(state.get("route_exec_count", 0)) + 1
@@ -2235,6 +2684,9 @@ def _auto_finish_from_planning_state(state: dict, session_facts: dict,
     if not activities and not restaurants:
         reason = "活动和餐厅候选均为空，无法提供备用规划或降级方案"
         return {"nodes": [], "summary": reason, "no_plan_reason": reason, "cot": [reason]}
+    if not skip_restaurant and not restaurants:
+        reason = "未找到可用餐厅候选，且用户未表示不吃饭；不将餐厅时段替换为活动"
+        return {"nodes": [], "summary": reason, "no_plan_reason": reason, "cot": [reason]}
 
     sf_for_score = {
         **dict(session_facts or {}),
@@ -2283,8 +2735,6 @@ def _auto_finish_from_planning_state(state: dict, session_facts: dict,
     cur_h, cur_m = add_min(sh, sm, 20)
     nodes = []
     no_restaurant_reason = ""
-    if not restaurants and not skip_restaurant:
-        no_restaurant_reason = "没有找到满足时间/偏好/营业状态的可用餐厅，已将餐厅时段降级替换为合适活动"
     selected_activities = activities[:3] if no_restaurant_reason else activities[:2]
     selected_restaurants = restaurants[:1]
     route_risks = state.get("route_risks") or []
@@ -3448,10 +3898,97 @@ async def generate_simulator_event(session_context: dict) -> dict:
             schema_hint='{"event_type":"...","target_poi_id":"...","severity":"...","message":"...","state_patch":{...}}',
             max_tokens=1024,
         )
-        return result
+        return _normalize_simulator_event(result, session_context)
     except Exception as e:
         logger.error(f"generate_simulator_event failed: {e}")
-        return _fallback_simulator_event(session_context)
+        return _normalize_simulator_event(_fallback_simulator_event(session_context), session_context)
+
+
+def _normalize_simulator_event(event: dict, context: dict) -> dict:
+    """Keep simulator output tied to the current itinerary and Mock API schema."""
+    normalized = dict(event or {})
+    itinerary = context.get("itinerary", []) or []
+    poi_ids = {n.get("poiId") for n in itinerary if n.get("poiId")}
+    restaurants = [n.get("poiId") for n in itinerary
+                   if n.get("poiId") and n.get("type") == "restaurant"]
+    activities = [n.get("poiId") for n in itinerary
+                  if n.get("poiId") and n.get("type") == "activity"]
+
+    event_type = normalized.get("event_type") or "custom"
+    target = normalized.get("target_poi_id")
+
+    if event_type in ("queue_spike", "queue_drop"):
+        if target not in poi_ids:
+            target = restaurants[0] if restaurants else None
+    elif event_type in ("booking_full", "activity_capacity_low", "activity_closed"):
+        if target not in poi_ids:
+            target = activities[0] if activities else None
+    elif event_type in ("weather_heavy_rain", "weather_clear"):
+        target = None
+    elif target not in poi_ids:
+        target = None
+
+    normalized["event_type"] = event_type
+    normalized["target_poi_id"] = target
+    normalized.setdefault("severity", "medium")
+    normalized.setdefault("message", "模拟环境发生变化")
+    normalized.setdefault("agent_dialogue", normalized["message"])
+
+    state_patch = dict(normalized.get("state_patch") or {})
+    queue_patch = state_patch.get("queue")
+    if isinstance(queue_patch, dict) and target and target in queue_patch and isinstance(queue_patch[target], dict):
+        state_patch["queue"] = queue_patch[target]
+        queue_patch = state_patch["queue"]
+    if isinstance(queue_patch, dict) and "estimated_wait_min" not in queue_patch:
+        wait_value = queue_patch.get("wait_min") or queue_patch.get("wait") or queue_patch.get("estimated_wait")
+        if wait_value is not None:
+            queue_patch["estimated_wait_min"] = int(wait_value)
+        else:
+            state_patch.pop("queue", None)
+            queue_patch = None
+    if isinstance(queue_patch, dict):
+        if "queue_tables" not in queue_patch and queue_patch.get("estimated_wait_min") is not None:
+            queue_patch["queue_tables"] = max(1, int(queue_patch["estimated_wait_min"]) // 3)
+        if "status" not in queue_patch:
+            queue_patch["status"] = "queue_spike" if event_type == "queue_spike" else "normal"
+        if "can_take_number" not in queue_patch:
+            queue_patch["can_take_number"] = True
+
+    if event_type == "queue_spike" and target and not state_patch.get("queue"):
+        state_patch["queue"] = {
+            "queue_tables": 20,
+            "estimated_wait_min": 60,
+            "can_take_number": True,
+            "status": "queue_spike",
+        }
+    elif event_type == "queue_drop" and target and not state_patch.get("queue"):
+        state_patch["queue"] = {
+            "queue_tables": 2,
+            "estimated_wait_min": 8,
+            "can_take_number": True,
+            "status": "normal",
+        }
+    elif event_type == "weather_heavy_rain" and not state_patch.get("weather"):
+        state_patch["weather"] = {
+            "condition": "heavy_rain",
+            "rain_level": "heavy",
+            "risk_level": "high",
+        }
+    elif event_type == "weather_clear" and not state_patch.get("weather"):
+        state_patch["weather"] = {
+            "condition": "sunny",
+            "rain_level": "none",
+            "risk_level": "low",
+        }
+    elif event_type in ("booking_full", "activity_capacity_low") and target and not state_patch.get("booking"):
+        state_patch["booking"] = {
+            "booking_required": True,
+            "availability": "full",
+            "available_slots": [],
+        }
+
+    normalized["state_patch"] = state_patch
+    return normalized
 
 
 def _fallback_simulator_event(context: dict) -> dict:
@@ -3570,10 +4107,17 @@ async def interpret_simulator_event(text: str, context: dict) -> dict:
             schema_hint='{"event_type":"...","target_poi_id":"...","severity":"...","message":"...","state_patch":{...}}',
             max_tokens=512,
         )
-        return result
+        normalized = _normalize_simulator_event(result, context)
+        text_implies_queue = any(w in text for w in ["排队", "等位", "等待", "人多", "拥挤", "堵"])
+        text_implies_weather = any(w in text for w in ["下雨", "雨", "天气差", "暴雨", "大雨"])
+        if text_implies_queue and normalized.get("event_type") not in ("queue_spike", "queue_drop"):
+            return _normalize_simulator_event(_fallback_interpret_event(text, context), context)
+        if text_implies_weather and normalized.get("event_type") not in ("weather_heavy_rain", "weather_clear"):
+            return _normalize_simulator_event(_fallback_interpret_event(text, context), context)
+        return normalized
     except Exception as e:
         logger.error(f"interpret_simulator_event failed: {e}")
-        return _fallback_interpret_event(text, context)
+        return _normalize_simulator_event(_fallback_interpret_event(text, context), context)
 
 
 def _fallback_interpret_event(text: str, context: dict) -> dict:
