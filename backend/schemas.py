@@ -25,6 +25,7 @@ class ExceptionConfirmRequest(BaseModel):
     request_id: Optional[str] = None
     exception_type: str = "queue_spike"
     original_node_id: Optional[str] = None
+    affected_poi_id: Optional[str] = None
     alternative: Optional[dict] = None
     recommended: Optional[dict] = None
 
@@ -41,6 +42,10 @@ class NodeActionRequest(BaseModel):
     action: str          # "delete" | "pin" | "replace"
     force: bool = False  # True = bypass soft_lock warning (user already confirmed)
     request_id: Optional[str] = None
+
+class NodeReplaceRequest(BaseModel):
+    node_id: str
+    replacement: dict
 
 
 class ReportRequest(BaseModel):
@@ -59,3 +64,8 @@ class InjectEventTextRequest(BaseModel):
 
 class NodeCheckinRequest(BaseModel):
     node_id: str
+
+
+class NodeUpdateRequest(BaseModel):
+    node_id: str
+    updates: dict

@@ -55,6 +55,46 @@ def split_csv(value):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def parse_hhmm(value):
+    try:
+        h, m = str(value).strip().split(":")[:2]
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+
+def parse_business_hours(value):
+    text = str(value or "").strip()
+    if text in ("全天", "24小时", "00:00-24:00", "0:00-24:00"):
+        return 0, 24 * 60
+    if "-" not in text:
+        return None
+    left, right = [part.strip() for part in text.split("-", 1)]
+    start = parse_hhmm(left)
+    end = parse_hhmm(right)
+    if start is None or end is None:
+        return None
+    if end == 0 and right.startswith("24"):
+        end = 24 * 60
+    return start, end
+
+
+def is_open_for_window(item, start_time=None, end_time=None):
+    start = parse_hhmm(start_time) if start_time else None
+    end = parse_hhmm(end_time) if end_time else start
+    if start is None:
+        return True
+    if end is None or end < start:
+        end = start
+    hours = parse_business_hours(item.get("business_hours"))
+    if not hours:
+        return True
+    open_min, close_min = hours
+    if close_min <= open_min:
+        return start >= open_min or end <= close_min
+    return start >= open_min and end <= close_min
+
+
 def get_poi(poi_id):
     for poi in POIS:
         if poi["poi_id"] == poi_id:
@@ -64,6 +104,12 @@ def get_poi(poi_id):
 
 def with_dynamic_status(poi):
     item = copy.deepcopy(poi)
+    hours = parse_business_hours(item.get("business_hours"))
+    if hours:
+        open_min, close_min = hours
+        item["open_time"] = f"{open_min // 60:02d}:{open_min % 60:02d}"
+        item["close_time"] = "24:00" if close_min == 24 * 60 else f"{close_min // 60:02d}:{close_min % 60:02d}"
+        item["is_24h"] = open_min == 0 and close_min == 24 * 60
     queue = STATE["queues"].get(item["poi_id"])
     if queue is not None:
         item["queue_min"] = queue["estimated_wait_min"]
@@ -130,6 +176,8 @@ def filter_by_common_params(items, query):
     categories = split_csv(first(query, "categories", ""))
     radius_raw = first(query, "radius_km")
     radius = float(radius_raw) if radius_raw else None
+    planned_time = first(query, "planned_time")
+    planned_end_time = first(query, "planned_end_time")
 
     accepted = _SCENARIO_ACCEPTED.get(scenario, [scenario, "both"]) if scenario else None
 
@@ -140,6 +188,8 @@ def filter_by_common_params(items, query):
         if categories and not _item_matches_category(item, categories):
             continue
         if radius is not None and item.get("distance_km", 0) > radius:
+            continue
+        if planned_time and not is_open_for_window(item, planned_time, planned_end_time):
             continue
         result.append(with_dynamic_status(item))
     return result

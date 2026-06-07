@@ -4,7 +4,7 @@ import MonitorPanel from './components/MonitorPanel'
 import UserProfilePanel from './components/UserProfilePanel'
 import ItinerarySheet from './components/ItinerarySheet'
 import ShareModal from './components/ShareModal'
-import { getOrCreateSession, checkinNode, dispatchTaxi, getUserLocation } from './api/agentClient'
+import { getOrCreateSession, checkinNode, dispatchTaxi, getUserLocation, updateNodeTime, replaceNode } from './api/agentClient'
 import './styles.css'
 
 export default function App() {
@@ -18,6 +18,10 @@ export default function App() {
   const [userProfile, setUserProfile]       = useState({ facts: null, preferences: null, phase: 'gathering' })
   const [detectedLocation, setDetectedLocation] = useState(null)
   const [transitPending, setTransitPending] = useState({})
+  const [taxiPrompt, setTaxiPrompt] = useState(null)
+  const [replacementPending, setReplacementPending] = useState(null)
+  const [replacementResult, setReplacementResult] = useState(null)
+  const [replacementBusy, setReplacementBusy] = useState(false)
 
   useEffect(() => {
     getOrCreateSession().then(setSessionId)
@@ -40,6 +44,9 @@ export default function App() {
     if (!sessionId) return
     const result = await checkinNode(sessionId, nodeId)
     if (result.nodes) updateItinerary(result.nodes)
+    if (result.next_requires_taxi && result.next_node) {
+      setTaxiPrompt(result.next_node)
+    }
   }, [sessionId, updateItinerary])
 
   const handleShare = useCallback(() => {
@@ -65,6 +72,17 @@ export default function App() {
       })
     }
   }, [sessionId])
+
+  const handleTaxiPromptConfirm = useCallback(async () => {
+    if (!taxiPrompt) return
+    const node = taxiPrompt
+    setTaxiPrompt(null)
+    await handleCallTaxi(node)
+  }, [taxiPrompt, handleCallTaxi])
+
+  const handleTaxiPromptDiscard = useCallback(() => {
+    setTaxiPrompt(null)
+  }, [])
 
   const mergeProfilePart = useCallback((prevPart, nextPart) => {
     if (!nextPart) return prevPart
@@ -96,16 +114,77 @@ export default function App() {
     setTransitPending(prev => ({ ...prev, [nodeId]: newTransit }))
   }, [])
 
-  const handleTransitConfirm = useCallback(() => {
-    setItinerary(prev => prev.map(node =>
-      transitPending[node.id] ? { ...node, transit: transitPending[node.id] } : node
-    ))
+  const handleTransitConfirm = useCallback(async () => {
+    if (!sessionId || Object.keys(transitPending).length === 0) return
+    let latestNodes = null
+    for (const [nodeId, transit] of Object.entries(transitPending)) {
+      const result = await updateNodeTime(sessionId, nodeId, { transit })
+      if (result.nodes) latestNodes = result.nodes
+    }
+    if (latestNodes) {
+      updateItinerary(latestNodes)
+    }
     setTransitPending({})
-  }, [transitPending])
+  }, [sessionId, transitPending, updateItinerary])
 
   const handleTransitDiscard = useCallback(() => {
     setTransitPending({})
   }, [])
+
+  const handleReplacementSelect = useCallback((node, alternative) => {
+    setReplacementPending({ node, alternative })
+  }, [])
+
+  const handleReplacementConfirm = useCallback(async () => {
+    if (!sessionId || !replacementPending || replacementBusy) return
+    setReplacementBusy(true)
+    const { node, alternative } = replacementPending
+    try {
+      const result = await replaceNode(sessionId, node.id, alternative)
+      if (result.blocked || result.error) {
+        setReplacementResult({
+          id: Date.now(),
+          error: true,
+          message: result.reason || result.error || '替换失败，请稍后重试。',
+        })
+        return
+      }
+      if (result.nodes) {
+        updateItinerary(result.nodes)
+        setReplacementResult({
+          id: Date.now(),
+          nodes: result.nodes,
+          replacedNode: result.replaced_node,
+          message: result.message || `已替换为 ${alternative.name}`,
+          shouldShowRedirect: Boolean(result.should_show_redirect),
+        })
+      }
+      setReplacementPending(null)
+    } finally {
+      setReplacementBusy(false)
+    }
+  }, [sessionId, replacementPending, replacementBusy, updateItinerary])
+
+  const handleReplacementDiscard = useCallback(() => {
+    setReplacementPending(null)
+  }, [])
+
+  const handleNewRoundStart = useCallback(() => {
+    setMonitorState(null)
+    setTaxiStatus(null)
+    setTaxiPrompt(null)
+    setTransitPending({})
+    setReplacementPending(null)
+    setReplacementResult(null)
+    setUserProfile({ facts: null, preferences: null, phase: 'gathering' })
+  }, [])
+
+  const handleNodeTimeChange = useCallback(async (nodeId, updates) => {
+    if (!sessionId) return
+    setItinerary(prev => prev.map(node => node.id === nodeId ? { ...node, ...updates } : node))
+    const result = await updateNodeTime(sessionId, nodeId, updates)
+    if (result.nodes) updateItinerary(result.nodes)
+  }, [sessionId, updateItinerary])
 
   const hasItinerary    = itinerary.length > 0
   const pendingCount    = Object.keys(transitPending).length
@@ -138,10 +217,14 @@ export default function App() {
           onMonitorUpdate={setMonitorState}
           onItineraryUpdate={updateItinerary}
           onProfileUpdate={handleProfileUpdate}
+          onNewRoundStart={handleNewRoundStart}
           itinerary={itinerary}
           onCheckin={handleCheckin}
           taxiStatus={taxiStatus}
           onTransitChange={handleTransitChange}
+          onNodeTimeChange={handleNodeTimeChange}
+          onReplacementSelect={handleReplacementSelect}
+          replacementResult={replacementResult}
         />
 
         {/* Floating transit confirm bar */}
@@ -150,6 +233,24 @@ export default function App() {
             <span className="transit-confirm-text">已调整 {pendingCount} 段交通</span>
             <button className="transit-confirm-discard" onClick={handleTransitDiscard}>忽略</button>
             <button className="transit-confirm-ok" onClick={handleTransitConfirm}>确认调整</button>
+          </div>
+        )}
+
+        {taxiPrompt && (
+          <div className="transit-confirm-bar" style={{ bottom: pendingCount > 0 ? 122 : 70 }}>
+            <span className="transit-confirm-text">下一站需要打车到 {taxiPrompt.name}，现在叫车吗？</span>
+            <button className="transit-confirm-discard" onClick={handleTaxiPromptDiscard}>稍后</button>
+            <button className="transit-confirm-ok" onClick={handleTaxiPromptConfirm}>确认打车</button>
+          </div>
+        )}
+
+        {replacementPending && (
+          <div className="transit-confirm-bar" style={{ bottom: pendingCount > 0 ? (taxiPrompt ? 174 : 122) : (taxiPrompt ? 122 : 70) }}>
+            <span className="transit-confirm-text">替换为 {replacementPending.alternative.name}</span>
+            <button className="transit-confirm-discard" onClick={handleReplacementDiscard} disabled={replacementBusy}>忽略</button>
+            <button className="transit-confirm-ok" onClick={handleReplacementConfirm} disabled={replacementBusy}>
+              {replacementBusy ? '替换中...' : '确认替换'}
+            </button>
           </div>
         )}
 

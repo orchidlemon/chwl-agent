@@ -50,6 +50,14 @@ PLANNING_TOOLS: list[dict] = [
                         "type": "string",
                         "description": "筛选类别，如 'park,museum'；不填返回全部",
                     },
+                    "planned_time": {
+                        "type": "string",
+                        "description": "计划到达活动的时间，HH:MM。工具会过滤营业时间外的活动。",
+                    },
+                    "planned_end_time": {
+                        "type": "string",
+                        "description": "计划离开活动的时间，HH:MM。若提供，活动必须覆盖完整时间段。",
+                    },
                 },
                 "required": ["scenario"],
             },
@@ -70,6 +78,14 @@ PLANNING_TOOLS: list[dict] = [
                     "preferences": {
                         "type": "string",
                         "description": "饮食偏好，如 '川菜' 或 '无辣，儿童友好'；不填不限",
+                    },
+                    "planned_time": {
+                        "type": "string",
+                        "description": "计划到达餐厅的时间，HH:MM。工具会过滤营业时间外的餐厅。",
+                    },
+                    "planned_end_time": {
+                        "type": "string",
+                        "description": "计划离开餐厅的时间，HH:MM。若提供，餐厅必须覆盖完整时间段。",
                     },
                 },
                 "required": ["scenario"],
@@ -254,6 +270,8 @@ async def execute_tool(name: str, args: dict,
             items = await tools.get_activities(
                 scenario=args.get("scenario", "family"),
                 categories=args.get("categories", "").split(",") if args.get("categories") else None,
+                planned_time=args.get("planned_time"),
+                planned_end_time=args.get("planned_end_time"),
             )
             if seen_poi_ids is not None:
                 for item in items:
@@ -266,6 +284,8 @@ async def execute_tool(name: str, args: dict,
             items = await tools.get_restaurants(
                 scenario=args.get("scenario", "family"),
                 preferences=prefs,
+                planned_time=args.get("planned_time"),
+                planned_end_time=args.get("planned_end_time"),
             )
             if seen_poi_ids is not None:
                 for item in items:

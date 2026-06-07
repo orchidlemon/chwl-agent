@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from backend.schemas import (
     ChatRequest, ConfirmationResolveRequest, ExceptionConfirmRequest, InjectEventTextRequest,
-    MemoryUpdateRequest, NodeActionRequest, NodeCheckinRequest,
+    MemoryUpdateRequest, NodeActionRequest, NodeCheckinRequest, NodeReplaceRequest, NodeUpdateRequest,
     PlanRequest, ReportRequest,
 )
 from backend.session import SessionManager
@@ -240,6 +240,11 @@ async def node_action(session_id: str, req: NodeActionRequest):
     nodes = manager.apply_node_action(session_id, req.node_id, req.action)
     return {"nodes": nodes}
 
+@app.post("/agent/{session_id}/node/replace")
+async def node_replace(session_id: str, req: NodeReplaceRequest):
+    manager.get_or_create(session_id)
+    return await orchestrator.run_node_replace(session_id, req.node_id, req.replacement)
+
 
 # ── Taxi dispatch proxy ───────────────────────────────────────────────
 
@@ -261,6 +266,15 @@ async def route_estimate(session_id: str, request: Request):
 
 
 # ── Node checkin (user marks node as visited) ─────────────────────────
+
+@app.post("/agent/{session_id}/node/update")
+async def node_update(session_id: str, req: NodeUpdateRequest):
+    manager.get_or_create(session_id)
+    allowed = {"timeStart", "timeEnd", "transit"}
+    updates = {k: v for k, v in req.updates.items() if k in allowed}
+    if not updates:
+        raise HTTPException(400, "No supported node updates")
+    return await orchestrator.run_node_update(session_id, req.node_id, updates)
 
 @app.post("/agent/{session_id}/node/checkin")
 async def node_checkin(session_id: str, req: NodeCheckinRequest):
@@ -354,10 +368,8 @@ async def simulator_inject(session_id: str, req: InjectEventTextRequest):
 
 @app.get("/agent/{session_id}/itinerary")
 async def get_itinerary(session_id: str):
-    s = manager.get(session_id)
-    if not s:
-        raise HTTPException(404, "Session not found")
-    return {"nodes": s["itinerary"]}
+    manager.get_or_create(session_id)
+    return {"nodes": orchestrator._current_itinerary(session_id)}
 
 
 # ── Sandbox / Demo controls ───────────────────────────────────────────

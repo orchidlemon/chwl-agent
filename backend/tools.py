@@ -136,21 +136,33 @@ async def _post(path: str, body: dict) -> dict:
 
 
 async def get_activities(scenario: str, radius_km: float = 10.0,
-                         categories: list = None) -> list:
+                         categories: list = None,
+                         planned_time: str | None = None,
+                         planned_end_time: str | None = None) -> list:
     """Search activities from Mock API by scenario + radius."""
     params = {"scenario": scenario, "radius_km": str(radius_km)}
     if categories:
         params["categories"] = ",".join(categories)
+    if planned_time:
+        params["planned_time"] = planned_time
+    if planned_end_time:
+        params["planned_end_time"] = planned_end_time
     data = await _get("/api/activities/search", params)
     return data.get("items", [])
 
 
 async def get_restaurants(scenario: str, preferences: list = None,
-                          radius_km: float = 10.0) -> list:
+                          radius_km: float = 10.0,
+                          planned_time: str | None = None,
+                          planned_end_time: str | None = None) -> list:
     """Search restaurants from Mock API, optionally filtered by food preferences."""
     params = {"scenario": scenario, "radius_km": str(radius_km)}
     if preferences:
         params["preferences"] = ",".join(preferences)
+    if planned_time:
+        params["planned_time"] = planned_time
+    if planned_end_time:
+        params["planned_end_time"] = planned_end_time
     data = await _get("/api/restaurants/search", params)
     return data.get("items", [])
 

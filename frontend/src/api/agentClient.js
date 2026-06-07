@@ -128,6 +128,22 @@ export async function nodeAction(sessionId, nodeId, action, force = false, reque
   return r.json()
 }
 
+export async function updateNodeTime(sessionId, nodeId, updates) {
+  const r = await fetch(`${BASE}/${sessionId}/node/update`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ node_id: nodeId, updates }),
+  })
+  return r.json()
+}
+export async function replaceNode(sessionId, nodeId, replacement) {
+  const r = await fetch(`${BASE}/${sessionId}/node/replace`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ node_id: nodeId, replacement }),
+  })
+  return r.json()
+}
 // ── User report ────────────────────────────────────────────────────────
 
 export async function reportIssue(sessionId, type, note = '') {

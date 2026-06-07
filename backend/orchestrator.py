@@ -20,8 +20,39 @@ REPLAN_WORDS = ("重新规划", "重规划", "换方案", "重来")
 STUCK_WORDS = ("卡住", "超时", "没结果", "一直", "不动", "等这一轮")
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
 def _emit(type_: str, **data) -> dict:
     return {"type": type_, **data}
+
+
+def _node_unique_key(node: dict) -> str:
+    poi_id = str(node.get("poiId") or node.get("poi_id") or "").strip()
+    if poi_id:
+        return f"poi:{poi_id}"
+    name = str(node.get("name") or "").strip()
+    node_type = str(node.get("type") or node.get("category") or "").strip()
+    return f"name:{node_type}:{name}" if name else ""
+
+
+def _dedupe_nodes(nodes: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    result = []
+    for node in nodes or []:
+        key = _node_unique_key(node)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        result.append(node)
+    return result
 
 
 def _voucher_code() -> str:
@@ -80,6 +111,7 @@ class Orchestrator:
         if phase_hint == "new_round":
             await self._prepare_next_round(session_id)
             yield _emit("text", content="收到，我会在本页面开启新一轮规划。")
+            yield _emit("typing")
             async for evt in self._run_clarify(session_id, message):
                 yield evt
             return
@@ -140,6 +172,12 @@ class Orchestrator:
                 yield _emit("text", content="我正在规划中。如果刚才那轮卡住了，直接说「重新规划」，我会重新开始。")
                 yield _emit("done")
         elif phase in ("monitoring", "needs_replan"):
+            if self._message_starts_new_trip(message):
+                await self._prepare_next_round(session_id)
+                yield _emit("typing")
+                async for evt in self._run_clarify(session_id, message):
+                    yield evt
+                return
             async for evt in self._run_monitoring_chat(session_id, message):
                 yield evt
         elif phase == "completed":
@@ -189,6 +227,9 @@ class Orchestrator:
             {},
             message,
         )
+        required_missing = skills.required_missing_fields(session_facts, message)
+        if required_missing:
+            session_facts = self._apply_default_missing_fields(session_facts, required_missing)
 
         self.manager.update_memory(session_id, "session_facts", session_facts)
         self.manager.update_memory(session_id, "derived_preferences", preferences)
@@ -258,6 +299,8 @@ class Orchestrator:
 
         confidence = result.get("confidence", "medium")
         missing    = result.get("missing_fields", [])
+        required_missing = skills.required_missing_fields(inferred, message)
+        missing = list(dict.fromkeys([*missing, *required_missing]))
         all_clear  = (
             confidence in ("high", "very_high")
             or (isinstance(confidence, (int, float)) and confidence >= 0.8)
@@ -268,7 +311,9 @@ class Orchestrator:
             inferred,
             inferred_prefs,
         )
-        if all_clear:
+        if required_missing:
+            msg = self._clarify_required_message(inferred, inferred_prefs, required_missing)
+        elif all_clear:
             msg = base_msg + "\n\n信息都齐了！直接点「开始规划」，我马上帮你安排 👇"
         else:
             msg = base_msg + "\n\n有需要补充或纠正的话直接告诉我，确认好了再点「开始规划」。"
@@ -308,6 +353,7 @@ class Orchestrator:
             confirmed.get("preferences", {}),
             message,
         )
+        required_missing = skills.required_missing_fields(updated_facts, message)
 
         # Persist the updated inference so "开始规划" uses fresh data
         if updated_facts:
@@ -315,6 +361,17 @@ class Orchestrator:
             self.manager.update_memory(session_id, "session_facts", updated_facts)
         if updated_preferences:
             self.manager.update_memory(session_id, "derived_preferences", updated_preferences)
+
+        if required_missing:
+            prompt = self._clarify_required_message(updated_facts or inferred, updated_preferences, required_missing)
+            yield _emit("clarify",
+                        message=prompt,
+                        ready_to_plan=True,
+                        phase="confirming",
+                        facts=updated_facts or inferred,
+                        preferences=updated_preferences)
+            yield _emit("done")
+            return
 
         # Build a short acknowledgement + prompt to start planning
         ack = skills.append_confirmed_requirements(
@@ -353,6 +410,9 @@ class Orchestrator:
             memory_preferences,
             "",
         )
+        required_missing = skills.required_missing_fields(session_facts)
+        if required_missing:
+            session_facts = self._apply_default_missing_fields(session_facts, required_missing)
 
         self.manager.update_memory(session_id, "session_facts", session_facts)
         self.manager.update_memory(session_id, "derived_preferences", preferences)
@@ -376,6 +436,77 @@ class Orchestrator:
 
     # ── Phase: monitoring (adjustment) ───────────────────────────────
 
+    def _required_missing_message(self, missing: list[str]) -> str:
+        parts = []
+        if "child_age" in missing:
+            parts.append("孩子大概几岁")
+        if "child_purpose" in missing:
+            parts.append("这次更偏科普学习（博物馆/科技馆），还是纯粹好玩")
+        if not parts:
+            return "还需要补充一点关键信息后再规划。"
+        return "先确认一下：" + "？".join(parts) + "？"
+
+    def _clarify_required_message(self, facts: dict, preferences: dict, missing: list[str]) -> str:
+        facts = facts or {}
+        preferences = preferences or {}
+        lines = ["收到！帮你推测了一下："]
+        companions = facts.get("companions") or []
+        if facts.get("scenario") == "family":
+            people = []
+            if "spouse" in companions:
+                people.append("老婆")
+            if "child" in companions or facts.get("has_children"):
+                people.append("孩子")
+            people_text = "你+" + "+".join(people) if people else "家庭出行"
+            lines.append(f"👨‍👩‍👧 家庭出行（{people_text}）")
+        if facts.get("start_time"):
+            lines.append(f"🗓️ {facts.get('start_time')} 出发")
+        if facts.get("duration_hours"):
+            lines.append(f"⏱️ 计划游玩时长：约{facts.get('duration_hours')}小时")
+        if facts.get("home_area") or facts.get("detected_location"):
+            lines.append(f"📍 出发地：{facts.get('home_area') or facts.get('detected_location')}")
+        if facts.get("travel_style"):
+            style = {"relaxed": "轻松休闲", "active": "活力充实"}.get(facts.get("travel_style"), facts.get("travel_style"))
+            lines.append(f"✨ 出行风格：{style}")
+
+        questions = []
+        if "child_age" in missing:
+            questions.append("1️⃣ 孩子大概几岁呀？")
+        if "child_purpose" in missing:
+            questions.append(f"{len(questions) + 1}️⃣ 这次是想带孩子涨知识（科博馆类）还是纯粹好玩就好？")
+        questions.append(f"{len(questions) + 1}️⃣ 出发地对吗？还是从别的地方走？")
+        lines.append("\n还有几个小问题帮我搞清楚：")
+        lines.extend(questions)
+
+        confirmed = skills.build_confirmed_requirements(facts, preferences)
+        if confirmed:
+            lines.append("\n已确定的需求：")
+            lines.extend(f"- {item}" for item in confirmed)
+        lines.append("\n有需要补充或纠正的话直接告诉我；也可以直接点「开始规划」，我会按默认情况继续。")
+        return "\n".join(lines)
+
+    def _apply_default_missing_fields(self, facts: dict, missing: list[str]) -> dict:
+        updated = dict(facts or {})
+        if "child_age" in missing or "child_purpose" in missing:
+            updated["has_children"] = True
+            updated["scenario"] = "family"
+            companions = list(updated.get("companions") or [])
+            if "child" not in companions:
+                companions.append("child")
+            updated["companions"] = companions
+            updated["child_confirmed_by_user"] = True
+        if "child_age" in missing:
+            updated["child_age"] = 10
+        if "child_purpose" in missing:
+            updated["child_purpose"] = "fun"
+        return updated
+
+    def _message_starts_new_trip(self, message: str) -> bool:
+        text = message or ""
+        companion_markers = ("孩子", "老婆", "老公", "朋友", "爸妈", "父母", "老人", "同事", "同学")
+        trip_markers = ("出门玩", "出去玩", "出行", "安排", "规划", "玩一天", "逛逛")
+        return any(w in text for w in companion_markers) and any(w in text for w in trip_markers)
+
     async def _run_monitoring_chat(self, session_id: str, message: str) -> AsyncGenerator[dict, None]:
         """Handle user adjustments during monitoring phase."""
         # For now: re-run planning with updated request
@@ -390,6 +521,17 @@ class Orchestrator:
         self.manager.update_memory(session_id, "derived_preferences", preferences)
         yield _emit("profile_updated", facts=session_facts,
                     preferences=preferences, phase="monitoring")
+
+        handled, schedule_msg = self._try_apply_schedule_feedback(session_id, message, session_facts)
+        if handled:
+            yield _emit("text", content=schedule_msg)
+            yield _emit("itinerary_updated",
+                        nodes=self.manager.get_itinerary(session_id),
+                        facts=session_facts,
+                        preferences=preferences,
+                        phase="monitoring")
+            yield _emit("done")
+            return
 
         handled, skip_msg = self._try_remove_restaurants_for_skip(
             session_id, session_facts, preferences
@@ -587,7 +729,12 @@ class Orchestrator:
             radius_km=20.0,
         )
         current_poi = itinerary[target_index].get("poiId")
-        candidates = [item for item in candidates if item.get("poi_id") != current_poi]
+        used_keys = {_node_unique_key(node) for index, node in enumerate(itinerary) if index != target_index}
+        candidates = [
+            item for item in candidates
+            if item.get("poi_id") != current_poi
+            and _node_unique_key({"poiId": item.get("poi_id"), **item}) not in used_keys
+        ]
         if not candidates:
             food_text = "、".join(requested_food)
             return False, f"我暂时没有找到可替换的{food_text}餐厅，继续为你重新规划。"
@@ -653,6 +800,208 @@ class Orchestrator:
             updated_node.get("poiId"),
         )
         return True, f"已按{'、'.join(requested_food)}帮你把餐厅换成：{updated_node.get('name')}。"
+    def _replacement_to_node(self, old_node: dict, replacement: dict) -> dict:
+        queue_min = replacement.get("queue_min")
+        if queue_min is None:
+            queue_text = str(replacement.get("queue") or replacement.get("queueText") or "")
+            digits = "".join(ch for ch in queue_text if ch.isdigit())
+            queue_min = int(digits) if digits else old_node.get("queueMin", 0)
+        queue_min = int(queue_min or 0)
+
+        distance = replacement.get("distance")
+        if not distance and replacement.get("distance_km") is not None:
+            distance = f"{float(replacement.get('distance_km') or 0):.1f}公里"
+
+        price = replacement.get("price")
+        if not price and replacement.get("avg_price") is not None:
+            price = f"¥{replacement.get('avg_price')}/位"
+
+        return {
+            **old_node,
+            "_showAlts": False,
+            "icon": replacement.get("icon", old_node.get("icon", "🍽️")),
+            "name": replacement.get("name", old_node.get("name", "")),
+            "sub": replacement.get("sub") or replacement.get("address") or old_node.get("sub", ""),
+            "distance": distance or old_node.get("distance", ""),
+            "queueMin": queue_min,
+            "queueText": replacement.get("queueText") or replacement.get("queue") or (
+                f"约{queue_min}分钟" if queue_min > 0 else "无需排队"
+            ),
+            "price": price or old_node.get("price", ""),
+            "rating": replacement.get("rating", old_node.get("rating", 4.5)),
+            "tags": replacement.get("tags") or old_node.get("tags", []),
+            "reason": replacement.get("reason") or replacement.get("cuisine") or "已按你的选择替换",
+            "poiId": replacement.get("poi_id") or replacement.get("poiId") or old_node.get("poiId", ""),
+            "booking_required": replacement.get("booking_required", old_node.get("booking_required", False)),
+            "booking_urgent": replacement.get("booking_required", old_node.get("booking_urgent", False)),
+            "ticket_price": replacement.get("ticket_price", old_node.get("ticket_price")),
+            "purchase_required": replacement.get("purchase_required", old_node.get("purchase_required", False)),
+            "ticket_required": replacement.get("ticket_required", old_node.get("ticket_required", False)),
+            "requires_user_action": replacement.get("requires_user_action", old_node.get("requires_user_action", False)),
+            "manual_action_required": replacement.get("manual_action_required", old_node.get("manual_action_required", False)),
+            "duration_min": int(replacement.get("duration_min") or replacement.get("estimated_duration_min") or old_node.get("duration_min") or 60),
+            "category": replacement.get("category", old_node.get("category", "")),
+            "business_hours": replacement.get("business_hours", old_node.get("business_hours", "")),
+            "risk_facts": replacement.get("risk_facts", old_node.get("risk_facts", [])),
+        }
+
+    async def run_node_replace(self, session_id: str, node_id: str, replacement: dict) -> dict:
+        itinerary = self._current_itinerary(session_id)
+        target = next((n for n in itinerary if n.get("id") == node_id), None)
+        if not target:
+            return {"error": "node_not_found", "nodes": itinerary}
+        if target.get("completed_lock"):
+            return {"blocked": True, "reason": "该节点已完成打卡，无法替换", "nodes": itinerary}
+        if not replacement or not replacement.get("name"):
+            return {"error": "replacement_missing", "nodes": itinerary}
+
+        old_poi = target.get("poiId")
+        next_poi = replacement.get("poi_id") or replacement.get("poiId")
+        alternatives_by_node = skills.read_node_alternatives_cache(session_id)
+        node_alt = alternatives_by_node.get(node_id) or {}
+        raw_replacement = next(
+            (
+                item for item in (node_alt.get("all_raw") or [])
+                if (item.get("poi_id") or item.get("poiId")) == next_poi
+            ),
+            None,
+        )
+        if raw_replacement:
+            replacement = {**raw_replacement, **replacement}
+            next_poi = replacement.get("poi_id") or replacement.get("poiId")
+        if next_poi and next_poi == old_poi:
+            return {"blocked": True, "reason": "备选餐厅与当前餐厅相同，请选择其他餐厅", "nodes": itinerary}
+
+        replacement_key = _node_unique_key({**replacement, "poiId": next_poi})
+        if replacement_key and any(_node_unique_key(n) == replacement_key for n in itinerary if n.get("id") != node_id):
+            return {"blocked": True, "reason": "该地点已在当前行程中，不能重复安排", "nodes": itinerary}
+
+        updated_node = self._replacement_to_node(target, replacement)
+        nodes = [
+            updated_node if n.get("id") == node_id else n
+            for n in itinerary
+        ]
+        target_index = next((i for i, n in enumerate(nodes) if n.get("id") == node_id), 0)
+        target_start = self._target_start_for_reflow(session_id, nodes, target_index)
+        nodes = self._reflow_from_index(nodes, target_index, target_start=target_start)
+        skills.update_planning_poi_cache(
+            session_id,
+            remove_poi_id=None,
+            add_item={
+                **dict(target.get("_raw_poi") or {}),
+                **target,
+                "poi_id": old_poi,
+                "type": target.get("type") or replacement.get("type"),
+            },
+        )
+        nodes = self._attach_node_alternatives(session_id, nodes)
+        self.manager.set_itinerary(session_id, nodes)
+        session = self.manager.get(session_id) or {}
+        fulfillment_started = bool(session.get("fulfillment_started"))
+        requires_user_action = _needs_user_redirect(updated_node)
+        self.manager.add_monitor_event(
+            session_id, "main_agent",
+            f"用户确认替换节点: {target.get('name')} -> {updated_node.get('name')}",
+            "node_replaced",
+            updated_node.get("poiId"),
+        )
+        return {
+            "nodes": nodes,
+            "replaced_node": updated_node,
+            "message": f"已把「{target.get('name')}」替换为「{updated_node.get('name')}」。",
+            "fulfillment_started": fulfillment_started,
+            "requires_user_action": requires_user_action,
+            "should_show_redirect": bool(fulfillment_started and requires_user_action),
+        }
+
+    async def run_node_update(self, session_id: str, node_id: str, updates: dict) -> dict:
+        itinerary = self._current_itinerary(session_id)
+        target_index = next((i for i, n in enumerate(itinerary) if n.get("id") == node_id), None)
+        if target_index is None:
+            return {"error": "node_not_found", "nodes": itinerary}
+
+        nodes = [dict(n) for n in itinerary]
+        node = {**nodes[target_index], **updates}
+        if "timeStart" in updates or "timeEnd" in updates:
+            start = self._parse_node_time(node.get("timeStart"))
+            end = self._parse_node_time(node.get("timeEnd"))
+            if end > start:
+                node["duration_min"] = end - start
+        nodes[target_index] = node
+
+        target_start = self._target_start_for_reflow(session_id, nodes, target_index)
+        if updates.get("timeStart"):
+            target_start = self._parse_node_time(updates["timeStart"])
+        nodes = self._reflow_from_index(nodes, target_index, target_start=target_start)
+        self.manager.set_itinerary(session_id, nodes)
+        self.manager.add_monitor_event(
+            session_id, "main_agent",
+            f"用户调整节点时间/交通: {node.get('name')}",
+            "node_time_reflowed",
+            node.get("poiId"),
+        )
+        return {"nodes": nodes}
+
+    def _best_cached_replacement(self, session_id: str, target_node: dict, itinerary: list[dict]) -> dict:
+        alternatives_by_node = skills.read_node_alternatives_cache(session_id)
+        node_alt = alternatives_by_node.get(target_node.get("id", "")) or {}
+        raw_items = []
+        for key in ("all_raw", "primary_raw", "reserve_raw"):
+            values = node_alt.get(key) or []
+            if isinstance(values, list):
+                raw_items.extend(values)
+        if not raw_items and isinstance(node_alt.get("all"), list):
+            raw_items.extend(node_alt.get("all") or [])
+
+        target_key = _node_unique_key(target_node)
+        target_poi = target_node.get("poiId") or target_node.get("poi_id")
+        used_keys = {_node_unique_key(node) for node in itinerary if node.get("id") != target_node.get("id")}
+        seen_keys = set()
+        candidates = []
+        for item in raw_items:
+            poi_id = item.get("poi_id") or item.get("poiId")
+            key = _node_unique_key({"poiId": poi_id, **item})
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            if key == target_key or poi_id == target_poi or key in used_keys:
+                continue
+            candidates.append(item)
+
+        def _score_key(item: dict):
+            llm_score = item.get("_llm_score")
+            score = _safe_float(llm_score, _safe_float(item.get("rating"), 0) * 20)
+            rank = _safe_float(item.get("alternative_rank"), 99)
+            rating = _safe_float(item.get("rating"), 0)
+            return (-score, rank, -rating)
+
+        candidates.sort(key=_score_key)
+        return dict(candidates[0]) if candidates else {}
+
+    def _apply_replacement_to_itinerary(self, session_id: str, itinerary: list[dict],
+                                        target_node: dict, replacement: dict) -> tuple[list[dict], dict]:
+        updated_node = self._replacement_to_node(target_node, replacement)
+        nodes = [
+            updated_node if n.get("id") == target_node.get("id") else n
+            for n in itinerary
+        ]
+        target_index = next((i for i, n in enumerate(nodes) if n.get("id") == target_node.get("id")), 0)
+        target_start = self._target_start_for_reflow(session_id, nodes, target_index)
+        nodes = self._reflow_from_index(nodes, target_index, target_start=target_start)
+        skills.update_planning_poi_cache(
+            session_id,
+            remove_poi_id=None,
+            add_item={
+                **dict(target_node.get("_raw_poi") or {}),
+                **target_node,
+                "poi_id": target_node.get("poiId") or target_node.get("poi_id"),
+                "type": target_node.get("type") or replacement.get("type"),
+                "alternative_rank": 1,
+            },
+        )
+        nodes = self._attach_node_alternatives(session_id, nodes)
+        self.manager.set_itinerary(session_id, nodes)
+        return nodes, updated_node
 
     async def _try_add_restaurant_when_requested(self, session_id: str, message: str,
                                                  session_facts: dict,
@@ -741,6 +1090,66 @@ class Orchestrator:
         )
         return True, f"可以，已按你的新想法加上餐厅：{restaurant_node.get('name')}。"
 
+    def _find_schedule_target_index(self, nodes: list[dict], message: str) -> int:
+        text = message or ""
+        for index, node in enumerate(nodes):
+            name = str(node.get("name") or "")
+            if name and name in text:
+                return index
+        if any(word in text for word in ("餐厅", "吃饭", "午饭", "晚饭", "用餐")):
+            for index, node in enumerate(nodes):
+                if node.get("type") == "restaurant" or node.get("category") == "restaurant":
+                    return index
+        for index, node in enumerate(nodes):
+            if not node.get("_checked") and not node.get("completed_lock"):
+                return index
+        return 0
+
+    def _try_apply_schedule_feedback(self, session_id: str, message: str,
+                                     session_facts: dict) -> tuple[bool, str]:
+        text = message or ""
+        if not any(word in text for word in ("太早", "太晚", "太赶", "时间太短")):
+            return False, ""
+
+        nodes = self.manager.get_itinerary(session_id)
+        if not nodes:
+            return False, ""
+
+        if "太赶" in text:
+            updated = self._reflow_from_index(nodes, 1, min_gap=20) if len(nodes) > 1 else nodes
+            self.manager.set_itinerary(session_id, updated)
+            self.manager.add_monitor_event(
+                session_id, "main_agent",
+                "用户反馈太赶，已将节点间缓冲增加到至少20分钟",
+                "schedule_buffer_adjusted",
+            )
+            return True, "已把后续节点间缓冲增加到至少 20 分钟，并同步更新行程时间。"
+
+        idx = self._find_schedule_target_index(nodes, text)
+        node = nodes[idx]
+        start = self._parse_node_time(node.get("timeStart") or node.get("startTime"))
+
+        if "太早" in text:
+            updated = self._reflow_from_index(nodes, idx, target_start=start + 60)
+            self.manager.set_itinerary(session_id, updated)
+            return True, f"已把「{node.get('name', '该节点')}」开始时间推迟至少 60 分钟，并顺延后续行程。"
+
+        if "太晚" in text:
+            updated = self._reflow_from_index(nodes, idx, target_start=max(0, start - 60))
+            self.manager.set_itinerary(session_id, updated)
+            return True, f"已把「{node.get('name', '该节点')}」开始时间提前至少 60 分钟，并同步调整后续行程。"
+
+        if "时间太短" in text:
+            updated = [dict(n) for n in nodes]
+            duration = self._node_duration_min(updated[idx], 60 if updated[idx].get("type") == "restaurant" else 90)
+            updated[idx]["timeEnd"] = self._format_node_time(start + duration + 30)
+            updated[idx]["duration_min"] = duration + 30
+            updated = self._reflow_from_index(updated, idx, target_start=start)
+            self.manager.set_itinerary(session_id, updated)
+            return True, f"已把「{node.get('name', '该节点')}」停留时间增加至少 30 分钟，并顺延后续行程。"
+
+        return False, ""
+
     @staticmethod
     def _parse_node_time(value: str | None) -> int:
         try:
@@ -753,6 +1162,419 @@ class Orchestrator:
     def _format_node_time(total_minutes: int) -> str:
         total_minutes = max(0, total_minutes)
         return f"{(total_minutes // 60) % 24:02d}:{total_minutes % 60:02d}"
+
+    def _node_duration_min(self, node: dict, default_min: int = 60) -> int:
+        raw = node.get("duration_min") or node.get("estimated_duration_min")
+        try:
+            if raw is not None:
+                return max(15, int(raw))
+        except Exception:
+            pass
+        start = self._parse_node_time(node.get("timeStart") or node.get("startTime"))
+        end = self._parse_node_time(node.get("timeEnd") or node.get("endTime"))
+        if end > start:
+            return end - start
+        raw = node.get("duration")
+        try:
+            return max(15, int(raw))
+        except Exception:
+            return default_min
+
+    def _current_transit_min(self, transit: dict | None) -> int:
+        transit = transit or {}
+        try:
+            return max(0, int(transit.get("duration_min") or transit.get("base_duration_min") or 0))
+        except Exception:
+            return 0
+
+    def _transit_buffer_min(self, transit: dict | None) -> int:
+        transit = transit or {}
+        base = int(transit.get("base_duration_min") or transit.get("duration_min") or 12)
+        distance = float(transit.get("distance_km") or 2.5)
+        candidates = [
+            base,
+            max(5, round(base * 0.75)),
+            max(8, round(base * 1.3)),
+            max(10, round(distance * 12)),
+        ]
+        return int(round((min(candidates) + max(candidates)) / 2))
+
+    def _apply_transit_buffers(self, nodes: list[dict], session_facts: dict | None = None,
+                               min_gap: int = 0) -> list[dict]:
+        if not nodes:
+            return nodes
+        session_facts = session_facts or {}
+        current = self._parse_node_time(session_facts.get("start_time", "14:00"))
+        reflowed = []
+        for node in nodes:
+            item = dict(node)
+            default_duration = 60 if item.get("type") == "restaurant" else 90
+            duration = self._node_duration_min(item, default_duration)
+            travel = self._transit_buffer_min(item.get("transit"))
+            original_transit = item.get("transit") or {}
+            item["transit"] = {
+                **original_transit,
+                "base_duration_min": original_transit.get("base_duration_min") or original_transit.get("duration_min"),
+                "duration_min": travel,
+                "buffer_min": travel,
+            }
+            start = current + max(travel, min_gap)
+            item["timeStart"] = self._format_node_time(start)
+            item["timeEnd"] = self._format_node_time(start + duration)
+            item["duration_min"] = duration
+            reflowed.append(item)
+            current = start + duration
+        return reflowed
+
+    def _reflow_from_index(self, nodes: list[dict], start_index: int,
+                           target_start: int | None = None, min_gap: int = 0) -> list[dict]:
+        if not nodes:
+            return nodes
+        updated = [dict(n) for n in nodes]
+        idx = max(0, min(start_index, len(updated) - 1))
+        current_end = None
+        for i in range(idx, len(updated)):
+            node = updated[i]
+            default_duration = 60 if node.get("type") == "restaurant" else 90
+            duration = self._node_duration_min(node, default_duration)
+            if i == idx and target_start is not None:
+                start = target_start
+            else:
+                prev_end = current_end
+                if prev_end is None and i > 0:
+                    prev_end = self._parse_node_time(updated[i - 1].get("timeEnd"))
+                travel = self._current_transit_min(node.get("transit"))
+                start = (prev_end or self._parse_node_time(node.get("timeStart"))) + max(travel, min_gap)
+            node["timeStart"] = self._format_node_time(start)
+            node["timeEnd"] = self._format_node_time(start + duration)
+            node["duration_min"] = duration
+            current_end = start + duration
+        return updated
+
+    def _target_start_for_reflow(self, session_id: str, nodes: list[dict], index: int) -> int:
+        node = nodes[index]
+        travel = self._current_transit_min(node.get("transit"))
+        if index > 0:
+            prev_end = self._parse_node_time(nodes[index - 1].get("timeEnd") or nodes[index - 1].get("endTime"))
+            return prev_end + travel
+        memory = self.manager.get_memory(session_id)
+        facts = memory.get("session_facts", {}) if memory else {}
+        base = self._parse_node_time(facts.get("start_time", "14:00"))
+        return base + travel
+
+    def _parse_business_hours(self, value: str | None) -> tuple[int, int] | None:
+        text = str(value or "").strip()
+        if text in ("全天", "24小时", "00:00-24:00", "0:00-24:00"):
+            return 0, 24 * 60
+        if "-" not in text:
+            return None
+        left, right = [part.strip() for part in text.split("-", 1)]
+        start = self._parse_node_time(left)
+        end = self._parse_node_time(right)
+        if end == 0 and right.startswith("24"):
+            end = 24 * 60
+        return start, end
+
+    def _within_business_hours(self, node: dict) -> bool:
+        hours = self._parse_business_hours(node.get("business_hours"))
+        if not hours:
+            return True
+        start = self._parse_node_time(node.get("timeStart") or node.get("startTime"))
+        end = self._parse_node_time(node.get("timeEnd") or node.get("endTime"))
+        if end < start:
+            end = start
+        open_min, close_min = hours
+        if close_min <= open_min:
+            return start >= open_min or end <= close_min
+        return start >= open_min and end <= close_min
+
+    def _candidate_within_window(self, candidate: dict, start: str, end: str) -> bool:
+        node = {"business_hours": candidate.get("business_hours"), "timeStart": start, "timeEnd": end}
+        return self._within_business_hours(node)
+
+    def _candidate_to_node(self, old_node: dict, candidate: dict) -> dict:
+        node_type = old_node.get("type") or candidate.get("type") or "activity"
+        queue_min = int(candidate.get("queue_min") or old_node.get("queueMin") or 0)
+        price = old_node.get("price", "")
+        if candidate.get("avg_price") is not None:
+            price = f"¥{candidate.get('avg_price')}/位"
+        elif candidate.get("ticket_price") is not None:
+            ticket = candidate.get("ticket_price")
+            price = "免费" if not ticket else f"¥{int(ticket)}/位"
+
+        return {
+            **old_node,
+            "_showAlts": False,
+            "type": node_type,
+            "icon": "🍽️" if node_type == "restaurant" else candidate.get("icon", old_node.get("icon", "🎯")),
+            "name": candidate.get("name", old_node.get("name", "")),
+            "sub": candidate.get("address", old_node.get("sub", "")),
+            "distance": f"{_safe_float(candidate.get('distance_km'), 0):.1f}公里",
+            "queueMin": queue_min,
+            "queueText": f"约{queue_min}分钟" if queue_min > 0 else "无需排队",
+            "price": price,
+            "rating": candidate.get("rating", old_node.get("rating", 4.5)),
+            "tags": candidate.get("tags") or old_node.get("tags", []),
+            "reason": "营业时间不匹配，已局部替换为同时间可用地点",
+            "poiId": candidate.get("poi_id", old_node.get("poiId", "")),
+            "booking_required": candidate.get("booking_required", old_node.get("booking_required", False)),
+            "booking_urgent": candidate.get("booking_required", old_node.get("booking_urgent", False)),
+            "ticket_price": candidate.get("ticket_price", old_node.get("ticket_price")),
+            "purchase_required": candidate.get("purchase_required", old_node.get("purchase_required", False)),
+            "ticket_required": candidate.get("ticket_required", old_node.get("ticket_required", False)),
+            "requires_user_action": candidate.get("requires_user_action", old_node.get("requires_user_action", False)),
+            "manual_action_required": candidate.get("manual_action_required", old_node.get("manual_action_required", False)),
+            "duration_min": self._node_duration_min(old_node, 60 if old_node.get("type") == "restaurant" else 90),
+            "category": candidate.get("category", old_node.get("category", "")),
+            "business_hours": candidate.get("business_hours", old_node.get("business_hours", "")),
+            "open_time": candidate.get("open_time", old_node.get("open_time", "")),
+            "close_time": candidate.get("close_time", old_node.get("close_time", "")),
+            "is_24h": candidate.get("is_24h", old_node.get("is_24h", False)),
+            "risk_facts": candidate.get("risk_facts", old_node.get("risk_facts", [])),
+        }
+
+    def _candidate_to_alternative(self, candidate: dict) -> dict:
+        queue_min = int(_safe_float(candidate.get("queue_min"), 0))
+        distance_km = _safe_float(candidate.get("distance_km"), 0)
+        price = ""
+        if candidate.get("avg_price") is not None:
+            price = f"¥{candidate.get('avg_price')}/位"
+        elif candidate.get("ticket_price") is not None:
+            ticket = candidate.get("ticket_price")
+            price = "免费" if not ticket else f"¥{int(_safe_float(ticket, 0))}/位"
+        return {
+            "poi_id": candidate.get("poi_id") or candidate.get("poiId"),
+            "poiId": candidate.get("poi_id") or candidate.get("poiId"),
+            "type": candidate.get("type") or candidate.get("alternative_group") or "activity",
+            "icon": candidate.get("icon") or ("🍽️" if (candidate.get("type") == "restaurant") else "🎯"),
+            "name": candidate.get("name", "备选地点"),
+            "sub": candidate.get("address") or candidate.get("sub") or "",
+            "distance": f"{distance_km:.1f}公里",
+            "distance_km": distance_km,
+            "queue": f"约{queue_min}分钟" if queue_min > 0 else "无需排队",
+            "queueText": f"约{queue_min}分钟" if queue_min > 0 else "无需排队",
+            "queue_min": queue_min,
+            "price": price,
+            "rating": candidate.get("rating"),
+            "tags": candidate.get("tags") or candidate.get("menu_features") or [],
+            "reason": candidate.get("reason") or candidate.get("cuisine") or "评分靠前备选",
+            "category": candidate.get("category", ""),
+            "booking_required": candidate.get("booking_required", False),
+            "booking_urgent": candidate.get("booking_urgent", candidate.get("booking_required", False)),
+            "ticket_price": candidate.get("ticket_price"),
+            "purchase_required": candidate.get("purchase_required", False),
+            "ticket_required": candidate.get("ticket_required", False),
+            "requires_user_action": candidate.get("requires_user_action", False),
+            "manual_action_required": candidate.get("manual_action_required", False),
+            "business_hours": candidate.get("business_hours", ""),
+            "open_time": candidate.get("open_time", ""),
+            "close_time": candidate.get("close_time", ""),
+            "is_24h": candidate.get("is_24h", False),
+            "alternative_rank": candidate.get("alternative_rank"),
+        }
+
+    def _current_itinerary(self, session_id: str) -> list[dict]:
+        itinerary = self.manager.get_itinerary(session_id)
+        if itinerary:
+            return itinerary
+        cached = skills.read_current_itinerary_cache(session_id)
+        if cached and self.manager.get(session_id):
+            self.manager.set_itinerary(session_id, cached)
+        return cached
+
+    def _raw_candidate_for_node(self, node: dict, cached_items: list[dict]) -> dict:
+        poi_id = node.get("poiId") or node.get("poi_id")
+        raw = next(
+            (
+                item for item in cached_items
+                if (item.get("poi_id") or item.get("poiId")) == poi_id
+            ),
+            {},
+        )
+        return {**dict(raw or {}), **dict(node or {}), "poi_id": poi_id, "poiId": poi_id}
+
+    def _attach_node_alternatives(self, session_id: str, nodes: list[dict]) -> list[dict]:
+        cached_items = skills.read_planning_poi_cache(session_id)
+        if not cached_items:
+            skills.write_current_itinerary_cache(session_id, nodes)
+            skills.write_node_alternatives_cache(session_id, {})
+            return nodes
+        used_keys = {_node_unique_key(node) for node in nodes}
+        result = []
+        alternatives_by_node: dict[str, dict] = {}
+        for node in nodes:
+            node_type = "restaurant" if node.get("type") == "restaurant" or node.get("category") == "restaurant" else "activity"
+            candidates = []
+            for item in cached_items:
+                item_type = "restaurant" if item.get("type") == "restaurant" or item.get("alternative_group") == "restaurant" else "activity"
+                if item_type != node_type:
+                    continue
+                if _node_unique_key({"poiId": item.get("poi_id") or item.get("poiId"), **item}) in used_keys:
+                    continue
+                candidates.append(item)
+            candidates = sorted(
+                candidates,
+                key=lambda item: (
+                    int(_safe_float(item.get("alternative_rank"), 99)),
+                    -_safe_float(item.get("rating"), 0),
+                ),
+            )[:7]
+            alternatives = [self._candidate_to_alternative(item) for item in candidates[:3]]
+            reserve = [self._candidate_to_alternative(item) for item in candidates[3:7]]
+            raw_current = self._raw_candidate_for_node(node, cached_items)
+            enriched_node = {
+                **node,
+                "_raw_poi": raw_current,
+                "alternatives": alternatives,
+                "alternative_reserve": reserve,
+            }
+            result.append(enriched_node)
+            alternatives_by_node[node.get("id", "")] = {
+                "node_id": node.get("id", ""),
+                "node_type": node_type,
+                "current": raw_current,
+                "primary": alternatives,
+                "reserve": reserve,
+                "all": [self._candidate_to_alternative(item) for item in candidates],
+                "primary_raw": candidates[:3],
+                "reserve_raw": candidates[3:7],
+                "all_raw": candidates,
+            }
+        skills.write_current_itinerary_cache(session_id, result)
+        skills.write_node_alternatives_cache(session_id, alternatives_by_node)
+        return result
+
+    def _cached_business_hour_candidates(self, cached_items: list[dict], node_type: str,
+                                         category: str | None, start: str, end: str) -> list[dict]:
+        candidates = []
+        for item in cached_items:
+            item_type = item.get("type")
+            if node_type == "restaurant":
+                if item_type != "restaurant":
+                    continue
+            elif item_type != "activity":
+                continue
+            if node_type == "activity" and category and item.get("category") != category:
+                continue
+            if item.get("open_status") == "closed" or item.get("availability") == "full":
+                continue
+            if not self._candidate_within_window(item, start, end):
+                continue
+            candidates.append(item)
+        return sorted(candidates, key=lambda cand: _safe_float(cand.get("rating"), 0), reverse=True)
+
+    async def _repair_business_hours(self, nodes: list[dict], session_facts: dict,
+                                     preferences: dict) -> tuple[list[dict], list[str]]:
+        if not nodes:
+            return nodes, []
+
+        updated = [dict(node) for node in nodes]
+        repairs: list[str] = []
+        used_poi_ids = {node.get("poiId") for node in updated if node.get("poiId")}
+        scenario = session_facts.get("scenario", "family")
+        food_prefs = preferences.get("food") or session_facts.get("food_preferences") or []
+        if isinstance(food_prefs, str):
+            food_prefs = [food_prefs]
+        cache_session_id = session_facts.get("_session_id") or session_facts.get("session_id")
+        cached_items = skills.read_planning_poi_cache(cache_session_id)
+
+        for idx, node in enumerate(updated):
+            node_type = node.get("type")
+            if node_type not in ("activity", "restaurant"):
+                continue
+            if self._within_business_hours(node):
+                continue
+
+            start = node.get("timeStart") or node.get("startTime") or ""
+            end = node.get("timeEnd") or node.get("endTime") or start
+            category = node.get("category")
+
+            if node_type == "restaurant":
+                candidates = self._cached_business_hour_candidates(
+                    cached_items, "restaurant", None, start, end
+                )
+                if not candidates:
+                    candidates = await tools.get_restaurants(
+                        scenario=scenario,
+                        preferences=food_prefs,
+                        radius_km=15,
+                        planned_time=start,
+                        planned_end_time=end,
+                    )
+                if not candidates:
+                    candidates = self._cached_business_hour_candidates(
+                        cached_items, "activity", None, start, end
+                    )
+                    if not candidates:
+                        candidates = await tools.get_activities(
+                            scenario=scenario,
+                            radius_km=15,
+                            planned_time=start,
+                            planned_end_time=end,
+                        )
+            else:
+                candidates = self._cached_business_hour_candidates(
+                    cached_items, "activity", category, start, end
+                )
+                if not candidates:
+                    candidates = await tools.get_activities(
+                        scenario=scenario,
+                        radius_km=15,
+                        categories=[category] if category else None,
+                        planned_time=start,
+                        planned_end_time=end,
+                    )
+                if not candidates:
+                    candidates = self._cached_business_hour_candidates(
+                        cached_items, "activity", None, start, end
+                    )
+                    if not candidates:
+                        candidates = await tools.get_activities(
+                            scenario=scenario,
+                            radius_km=15,
+                            planned_time=start,
+                            planned_end_time=end,
+                        )
+
+            replacement = next(
+                (
+                    cand for cand in candidates
+                    if cand.get("poi_id") not in used_poi_ids
+                    and cand.get("open_status") != "closed"
+                    and cand.get("availability") != "full"
+                    and self._candidate_within_window(cand, start, end)
+                ),
+                None,
+            )
+            if replacement:
+                used_poi_ids.discard(node.get("poiId"))
+                used_poi_ids.add(replacement.get("poi_id"))
+                replacement_type = replacement.get("type") or ("activity" if node_type == "restaurant" and not replacement.get("cuisine") else node_type)
+                updated[idx] = self._candidate_to_node({**node, "type": replacement_type}, replacement)
+                skills.update_planning_poi_cache(
+                    cache_session_id,
+                    remove_poi_id=node.get("poiId"),
+                    add_item={
+                        **replacement,
+                        "poi_id": replacement.get("poi_id") or replacement.get("poiId"),
+                        "type": replacement_type,
+                    },
+                )
+                repairs.append(
+                    f"「{node.get('name')}」{start}-{end} 不在营业时间 {node.get('business_hours') or '未知'} 内，"
+                    f"已替换为「{replacement.get('name')}」（{replacement.get('business_hours')}）"
+                    + ("；餐厅无可用候选，已用活动降级替代" if node_type == "restaurant" and replacement_type == "activity" else "")
+                )
+            else:
+                facts = list(node.get("risk_facts") or [])
+                warning = f"{start}-{end} 不在营业时间 {node.get('business_hours') or '未知'} 内，暂无可替代地点"
+                if warning not in facts:
+                    facts.append(warning)
+                node["risk_facts"] = facts
+                updated[idx] = node
+                repairs.append(f"「{node.get('name')}」{warning}")
+
+        return updated, repairs
 
     async def _run_plan_core(self, session_id: str, session_facts: dict,
                              preferences: dict,
@@ -771,7 +1593,11 @@ class Orchestrator:
             if n.get("user_pinned") or n.get("pinned")
         ]
         # Pass pinned slot info to planner so LLM avoids those time ranges
-        sf_with_pinned = {**session_facts, "_pinned_nodes": pinned_nodes}
+        sf_with_pinned = {
+            **session_facts,
+            "_pinned_nodes": pinned_nodes,
+            "_session_id": session_id,
+        }
 
         yield _emit("status", id=1, text="正在解析您的需求", status="done")
         yield _emit("status", id=2, text="Agent 工具调用：获取实时数据…", status="loading")
@@ -850,9 +1676,11 @@ class Orchestrator:
             "agent_done"
         )
 
-        nodes = plan.get("nodes", [])
+        nodes = _dedupe_nodes(plan.get("nodes", []))
         if not nodes:
-            yield _emit("error", message="行程生成失败：没有找到合适的节点，请重新发送出行需求后重试。")
+            reason = plan.get("no_plan_reason") or plan.get("summary") or "没有找到合适的活动/餐厅候选，且无法提供备用规划或降级方案"
+            self.manager.add_monitor_event(session_id, "main_agent", f"无规划：{reason}", "no_plan")
+            yield _emit("text", content=f"暂时无法生成可执行行程：{reason}")
             yield _emit("done")
             return
 
@@ -908,6 +1736,7 @@ class Orchestrator:
                 "to_poi_id":   nodes[0].get("poiId", ""),
                 "mode":        "taxi",
                 "duration_min": 20,          # fixed 20-min commute matching time offset
+                "base_duration_min": 20,
                 "distance_km":  first_dist,
             }
 
@@ -923,12 +1752,13 @@ class Orchestrator:
                         "to_poi_id":   curr_poi,
                         "mode":        "taxi",
                         "duration_min": route.get("duration_min", 12),
+                        "base_duration_min": route.get("duration_min", 12),
                         "distance_km":  route.get("distance_km", 2.5),
                     }
                 except Exception:
                     nodes[i]["transit"] = {
                         "from_poi_id": prev_poi, "to_poi_id": curr_poi,
-                        "mode": "taxi", "duration_min": 12, "distance_km": 2.5,
+                        "mode": "taxi", "duration_min": 12, "base_duration_min": 12, "distance_km": 2.5,
                     }
 
         # ── Merge pinned nodes back, drop time-overlapping new nodes ────
@@ -963,7 +1793,34 @@ class Orchestrator:
                 pinned_nodes + new_nodes,
                 key=lambda n: _to_min(n.get("timeStart", "99:99")),
             )
+            nodes = _dedupe_nodes(nodes)
 
+        session_facts_for_repair = {**session_facts, "_session_id": session_id}
+        nodes = self._apply_transit_buffers(nodes, session_facts)
+        nodes, hours_repairs = await self._repair_business_hours(nodes, session_facts_for_repair, preferences)
+        for repair in hours_repairs:
+            yield _emit("cot_step", text=f"⚠️ 营业时间二次检查：{repair}")
+        unresolved = [
+            node for node in nodes
+            if node.get("type") in ("activity", "restaurant") and not self._within_business_hours(node)
+        ]
+        if unresolved:
+            reason = "、".join(
+                f"{node.get('name')}({node.get('timeStart')}-{node.get('timeEnd')} 不在营业时间 {node.get('business_hours') or '未知'} 内)"
+                for node in unresolved[:3]
+            )
+            self.manager.add_monitor_event(session_id, "main_agent", f"无规划：{reason}", "no_plan")
+            yield _emit("text", content=f"暂时无法生成可执行行程：{reason}，且没有找到可替代活动/餐厅。")
+            yield _emit("done")
+            return
+        if hours_repairs:
+            self.manager.add_monitor_event(
+                session_id, "main_agent",
+                f"营业时间二次检查完成：{len(hours_repairs)} 个节点被处理",
+                "business_hours_repaired",
+            )
+
+        nodes = self._attach_node_alternatives(session_id, nodes)
         self.manager.set_itinerary(session_id, nodes)
         self._clear_planning_started(session_id)
         self.manager.set_phase(session_id, "monitoring")
@@ -1023,13 +1880,17 @@ class Orchestrator:
 
     async def run_fulfill(self, session_id: str) -> AsyncGenerator[dict, None]:
         """Booking flow: emit progress per node. Does NOT auto-trigger exceptions."""
-        itinerary = self.manager.get_itinerary(session_id)
+        itinerary = self._current_itinerary(session_id)
         memory = self.manager.get_memory(session_id)
 
         if not itinerary:
             yield _emit("error", message="行程为空，请先规划")
             yield _emit("done")
             return
+
+        session = self.manager.get(session_id)
+        if session is not None:
+            session["fulfillment_started"] = True
 
         items = [
             *[{"id": n["id"], "icon": n["icon"], "name": n["name"],
@@ -1080,17 +1941,12 @@ class Orchestrator:
                         voucher=voucher)
 
             # Popup only for nodes that actually need user booking action
-            needs_redirect = (
-                node["type"] == "restaurant"
-                or node.get("booking_required")
-                or node.get("booking_urgent")
-            )
+            needs_redirect = _needs_user_redirect(node)
             if needs_redirect:
-                site = "美团·排号" if node["type"] == "restaurant" else "美团·预约"
                 yield _emit("booking_redirect",
                             name=node.get("name", ""),
                             node_id=node["id"],
-                            site=site,
+                            site=_redirect_site(node),
                             mock_url=f"https://i.meituan.com/mock/{node.get('poiId','')}")
                 await asyncio.sleep(0.3)
 
@@ -1144,6 +2000,7 @@ class Orchestrator:
         exception_type = data.get("exception_type", "queue_spike")
         recommended    = data.get("recommended", {})
         original_node_id = data.get("original_node_id")
+        affected_poi_id = data.get("affected_poi_id")
         confirmed = bool(data.get("confirmed", True))
         request_id = data.get("request_id")
 
@@ -1174,49 +2031,86 @@ class Orchestrator:
         def _is_protected(n: dict) -> bool:
             return n.get("completed_lock") or n.get("user_pinned") or n.get("pinned") or n.get("locked")
 
-        target_node = next(
-            (n for n in itinerary if not _is_protected(n)), None
-        )
+        target_node = next((n for n in itinerary if not _is_protected(n)), None)
+        if affected_poi_id:
+            by_poi = next((n for n in itinerary if n.get("poiId") == affected_poi_id), None)
+            if by_poi and not by_poi.get("completed_lock") and not by_poi.get("user_pinned"):
+                target_node = by_poi
         if original_node_id:
             specific = next((n for n in itinerary if n["id"] == original_node_id), None)
             # Only use the specific node if it is not protected
             if specific and not specific.get("completed_lock") and not specific.get("user_pinned"):
                 target_node = specific
 
-        if target_node and recommended:
-            updates = {
-                "name": recommended.get("name", target_node["name"]),
-                "sub": recommended.get("sub", target_node.get("sub", "")),
-                "icon": recommended.get("icon", target_node["icon"]),
-                "queueText": recommended.get("queueText", ""),
-                "distance": recommended.get("distance", ""),
-                "tags": recommended.get("tags", []),
-                "reason": recommended.get("reason", ""),
-                "poiId": recommended.get("poi_id", target_node["poiId"]),
-            }
-            self.manager.update_node(session_id, target_node["id"], updates)
+        cached_replacement = self._best_cached_replacement(session_id, target_node, itinerary) if target_node else {}
+
+        if target_node and cached_replacement:
+            nodes, updated_node = self._apply_replacement_to_itinerary(
+                session_id,
+                itinerary,
+                target_node,
+                cached_replacement,
+            )
+            itinerary = nodes
+            self.manager.add_monitor_event(
+                session_id, "main_agent",
+                f"从节点备选项选择最高分方案，切换至: {updated_node.get('name')}",
+                "replan_from_alternatives",
+                updated_node.get("poiId"),
+            )
+        elif target_node and recommended:
+            used_keys = {_node_unique_key(n) for n in itinerary if n.get("id") != target_node.get("id")}
+            recommended_key = _node_unique_key({
+                **recommended,
+                "poiId": recommended.get("poi_id") or recommended.get("poiId"),
+            })
+            if (
+                (recommended.get("poi_id") or recommended.get("poiId")) != target_node.get("poiId")
+                and (not recommended_key or recommended_key not in used_keys)
+            ):
+                nodes, updated_node = self._apply_replacement_to_itinerary(
+                    session_id,
+                    itinerary,
+                    target_node,
+                    recommended,
+                )
+                itinerary = nodes
         elif target_node and not recommended:
             # No specific alternative — call Mock API for alternatives then replan
             memory   = self.manager.get_memory(session_id)
             scenario = memory.get("session_facts", {}).get("scenario", "family")
             try:
+                exclude_poi = affected_poi_id or target_node.get("poiId")
                 alt_data   = await tools.get_alternatives(
-                    scenario, exception_type, target_node.get("poiId")
+                    scenario, exception_type, exclude_poi
                 )
-                event_data = {"type": exception_type, "message": "用户确认需要换方案"}
-                replan     = await skills.replan_partial(event_data, itinerary, alt_data, memory)
-                rec        = replan.get("recommended", {})
+                options = [
+                    item for item in [
+                        *(alt_data.get("recommended") or []),
+                        *(alt_data.get("more_options") or []),
+                    ]
+                    if item.get("poi_id") != exclude_poi and item.get("poi_id") != target_node.get("poiId")
+                    and _node_unique_key({"poiId": item.get("poi_id"), **item}) not in {
+                        _node_unique_key(n) for n in itinerary if n.get("id") != target_node.get("id")
+                    }
+                ]
+                rec = options[0] if options else {}
+                if not rec:
+                    event_data = {"type": exception_type, "message": "用户确认需要换方案"}
+                    replan     = await skills.replan_partial(event_data, itinerary, alt_data, memory)
+                    rec        = replan.get("recommended", {})
+                    rec_key = _node_unique_key({**rec, "poiId": rec.get("poi_id") or rec.get("poiId")})
+                    used_keys = {_node_unique_key(n) for n in itinerary if n.get("id") != target_node.get("id")}
+                    if (rec.get("poi_id") or rec.get("poiId")) == target_node.get("poiId") or rec_key in used_keys:
+                        rec = {}
                 if rec and rec.get("name"):
-                    self.manager.update_node(session_id, target_node["id"], {
-                        "name":      rec.get("name", target_node["name"]),
-                        "sub":       rec.get("sub", target_node.get("sub", "")),
-                        "icon":      rec.get("icon", target_node["icon"]),
-                        "queueText": rec.get("queueText", ""),
-                        "distance":  rec.get("distance", ""),
-                        "tags":      rec.get("tags", []),
-                        "reason":    rec.get("reason", ""),
-                        "poiId":     rec.get("poi_id", target_node.get("poiId", "")),
-                    })
+                    nodes, updated_node = self._apply_replacement_to_itinerary(
+                        session_id,
+                        itinerary,
+                        target_node,
+                        rec,
+                    )
+                    itinerary = nodes
                     self.manager.add_monitor_event(
                         session_id, "main_agent",
                         f"调用 Mock API 获取备选，切换至: {rec.get('name')}", "replan_from_api"
@@ -1331,11 +2225,14 @@ class Orchestrator:
 
         # Set pending chat notification for User Agent's polling loop
         event_record = api_result.get("event", event)
+        target_poi_id = event.get("target_poi_id")
+        target_node = next((n for n in itinerary if n.get("poiId") == target_poi_id), None)
         s["pending_monitor_msg"] = {
             "type": event.get("event_type", "custom"),
             "message": event.get("message", ""),
             "severity": event.get("severity", "medium"),
-            "poi_id": event.get("target_poi_id"),
+            "poi_id": target_poi_id,
+            "node_id": target_node.get("id") if target_node else None,
         }
 
         return {
@@ -1359,6 +2256,7 @@ class Orchestrator:
 
         next_node = next((n for n in updated if not n.get("_checked")), None)
         node_name = node.get("name", "节点")
+        next_requires_taxi = bool(next_node and (next_node.get("transit") or {}).get("mode") == "taxi")
 
         if next_node:
             msg = (
@@ -1394,6 +2292,7 @@ class Orchestrator:
             )
 
         return {"nodes": updated, "next_node": next_node,
+                "next_requires_taxi": next_requires_taxi,
                 "message": msg, "done_count": done_count, "total": total}
 
     async def stop_background_watch(self, session_id: str) -> None:
@@ -1486,11 +2385,14 @@ class Orchestrator:
         )
 
         # Notify User Agent via pending chat event
+        target_poi_id = event.get("target_poi_id")
+        target_node = next((n for n in itinerary if n.get("poiId") == target_poi_id), None)
         s["pending_monitor_msg"] = {
             "type": event.get("event_type", "custom"),
             "message": event.get("message", text[:60]),
             "severity": event.get("severity", "medium"),
-            "poi_id": event.get("target_poi_id"),
+            "poi_id": target_poi_id,
+            "node_id": target_node.get("id") if target_node else None,
         }
 
         return {
@@ -1535,7 +2437,44 @@ class Orchestrator:
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+def _ticket_price_value(node: dict) -> float:
+    raw = node.get("ticket_price")
+    if raw is None:
+        raw = node.get("ticketPrice")
+    if raw is None and node.get("type") != "restaurant":
+        raw = node.get("price")
+    if raw is None:
+        return 0.0
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    digits = "".join(ch for ch in str(raw) if ch.isdigit() or ch == ".")
+    try:
+        return float(digits) if digits else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _needs_user_redirect(node: dict) -> bool:
+    if not node:
+        return False
+    if node.get("booking_required") or node.get("booking_urgent"):
+        return True
+    if node.get("purchase_required") or node.get("ticket_required"):
+        return True
+    if node.get("requires_user_action") or node.get("manual_action_required"):
+        return True
+    return node.get("type") != "restaurant" and _ticket_price_value(node) > 0
+
+
+def _redirect_site(node: dict) -> str:
+    if node.get("booking_required") or node.get("booking_urgent"):
+        return "美团·预约"
+    return "美团·购票"
+
+
 def _action_label(node: dict) -> str:
+    if _needs_user_redirect(node) and not (node.get("booking_required") or node.get("booking_urgent")) and node.get("type") != "restaurant":
+        return "购票中..."
     if node["type"] == "restaurant":
         return "取号排队中..."
     if node["type"] == "light":
@@ -1546,6 +2485,8 @@ def _action_label(node: dict) -> str:
 
 
 def _done_label(node: dict) -> str:
+    if _needs_user_redirect(node) and not (node.get("booking_required") or node.get("booking_urgent")) and node.get("type") != "restaurant":
+        return "购票成功"
     if node["type"] == "restaurant":
         return "取号成功"
     if node["type"] == "light":

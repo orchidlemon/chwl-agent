@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react'
 import ItineraryCards from './ItineraryCards'
-
 // ── Agent bubble wrapper ──────────────────────────────────────────
 function AgentWrap({ children, noAvatar }) {
   return (
@@ -317,7 +316,7 @@ function MonitorAlertBubble({ content, severity }) {
 }
 
 // ── Main dispatcher ───────────────────────────────────────────────
-export default function ChatMessage({ msg, onNodeAction, onTransitChange, onExceptionConfirm, onExceptionDismiss, onReportSelect, onSoftLockConfirm, onSoftLockDismiss }) {
+export default function ChatMessage({ msg, onNodeAction, onNodeTimeChange, onTransitChange, onReplacementSelect, onExceptionConfirm, onExceptionDismiss, onReportSelect, onSoftLockConfirm, onSoftLockDismiss }) {
   if (msg.role === 'user') return <UserBubble content={msg.content} />
 
   switch (msg.type) {
@@ -331,7 +330,9 @@ export default function ChatMessage({ msg, onNodeAction, onTransitChange, onExce
           nodes={msg.nodes}
           summary={msg.summary}
           onNodeAction={onNodeAction}
+          onNodeTimeChange={onNodeTimeChange}
           onTransitChange={onTransitChange}
+          onReplacementSelect={onReplacementSelect}
         />
       </AgentWrap>
     )

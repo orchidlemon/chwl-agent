@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 
 const MODES = [
   { id: 'walking', icon: '🚶', label: '步行' },
@@ -19,6 +19,12 @@ export default function TransitBar({ transit, isFirst, onCallAction, onModeChang
   const [dur, setDur]   = useState(transit?.duration_min || 12)
   const [dist, setDist] = useState(transit?.distance_km || 2.5)
   const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    setMode(transit?.mode || 'taxi')
+    setDur(transit?.duration_min || 12)
+    setDist(transit?.distance_km || 2.5)
+  }, [transit])
 
   const handleModeChange = async (newMode) => {
     if (newMode === mode) return

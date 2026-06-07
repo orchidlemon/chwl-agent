@@ -44,6 +44,7 @@ class SessionManager:
             "itinerary": [],
             # Fulfillment results per node
             "fulfillment": {},
+            "fulfillment_started": False,
             # Watch task ids
             "watch_ids": [],
             # Per-user copy of mock dynamic state
@@ -164,10 +165,30 @@ class SessionManager:
         s = self.get(session_id)
         if s:
             s["itinerary"] = nodes
+            try:
+                from . import skills
+                skills.write_current_itinerary_cache(session_id, nodes)
+            except Exception:
+                pass
 
     def get_itinerary(self, session_id: str) -> list:
         s = self.get(session_id)
-        return s["itinerary"] if s else []
+        if not s:
+            try:
+                from . import skills
+                return skills.read_current_itinerary_cache(session_id)
+            except Exception:
+                return []
+        if s.get("itinerary"):
+            return s["itinerary"]
+        try:
+            from . import skills
+            cached = skills.read_current_itinerary_cache(session_id)
+        except Exception:
+            cached = []
+        if cached:
+            s["itinerary"] = cached
+        return s["itinerary"]
 
     def apply_node_action(self, session_id: str, node_id: str, action: str) -> list:
         nodes = self.get_itinerary(session_id)
@@ -485,6 +506,7 @@ class SessionManager:
             s["memory"] = {"session_facts": {}, "confirmed_preferences": {}, "derived_preferences": {}}
             s["itinerary"] = []
             s["fulfillment"] = {}
+            s["fulfillment_started"] = False
             s["sandbox"] = copy.deepcopy(BASE_STATE)
             s["pending_exception"] = None
             s["pending_confirmations"] = {}
@@ -506,6 +528,7 @@ class SessionManager:
         s["memory"] = {"session_facts": {}, "confirmed_preferences": {}, "derived_preferences": {}}
         s["itinerary"] = []
         s["fulfillment"] = {}
+        s["fulfillment_started"] = False
         s["sandbox"] = copy.deepcopy(BASE_STATE)
         s["pending_exception"] = None
         s["pending_confirmations"] = {}

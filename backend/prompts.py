@@ -589,6 +589,8 @@ AGENT_PLAN_SYSTEM = BUTLER_SYSTEM + """
 - 有孩子时行程结束 ≤ 20:00
 - 每个 poiId 必须来自工具返回的真实数据，严禁编造
 - startTime/endTime 格式为 HH:MM
+- 【营业时间硬约束】活动和餐厅都必须安排在 business_hours/open_time-close_time 范围内；若某 POI 不能完整覆盖 startTime-endTime，禁止放入路线。00:00-24:00 表示全天可去。
+- 【无候选降级】如果餐厅候选为 0 且无法提供可用餐厅方案，可将原餐厅时段替换为合适活动，并在 summary 说明无餐厅规划原因；如果活动和餐厅候选均为 0，且无法提供备用规划/降级，允许输出无规划及原因。
 - 【重要】不要因为某一段路程偏长就减少节点数量；只要各段通勤不超过该目的地停留时长，方案就是合格的
 - 【禁止】不得安排连续两个餐厅节点（type=restaurant 或 category=restaurant 的节点）；餐厅之间必须有至少一个活动节点间隔
 - 【酒吧双重属性】酒吧（category=bar_entertainment）既可作为活动节点也可替代餐饮节点；在判断"连续餐厅"规则时，酒吧节点视为娱乐活动，不算餐厅
@@ -596,6 +598,7 @@ AGENT_PLAN_SYSTEM = BUTLER_SYSTEM + """
 ## 工具调用参数规则（严格执行）
 - search_restaurants：若用户有饮食偏好（如川菜/粤菜/火锅/轻食等），**必须**将其填入 preferences 参数；没有偏好才可以不填
 - search_activities：若用户偏好商场（venue_preference=mall），categories 参数填「mall」；若用户偏好室内，categories 参数填「indoor」；否则不传 categories
+- search_activities/search_restaurants：必须传入 planned_time；能预估离开时间时同时传 planned_end_time，让工具先过滤营业时间外候选
 
 ## 用户具体需求优先级（最高）
 - 用户明确说出的具体需求（菜系、场地类型、活动类型等）**必须被满足**，视同硬性约束

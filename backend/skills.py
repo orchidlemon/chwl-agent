@@ -7,12 +7,166 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from typing import Optional
 
 from . import prompts
 
 logger = logging.getLogger(__name__)
+
+
+def _planning_cache_path(session_id: str | None) -> str:
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(session_id or "default"))[:80]
+    return os.path.join(tempfile.gettempdir(), "meituan_planner_cache", f"planning_poi_cache_{safe_id}.json")
+
+
+def _planner_cache_file(session_id: str | None, name: str) -> str:
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(session_id or "default"))[:80]
+    return os.path.join(tempfile.gettempdir(), "meituan_planner_cache", f"{name}_{safe_id}.json")
+
+
+def _write_json_cache(path: str, payload: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        logger.warning(f"[AgentPlan] failed to write cache {path}: {exc}")
+
+
+def _read_json_cache(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning(f"[AgentPlan] failed to read cache {path}: {exc}")
+        return {}
+
+
+def write_current_itinerary_cache(session_id: str | None, nodes: list[dict]) -> None:
+    _write_json_cache(
+        _planner_cache_file(session_id, "current_itinerary"),
+        {"session_id": session_id, "updated_at": time.time(), "nodes": nodes or []},
+    )
+
+
+def read_current_itinerary_cache(session_id: str | None) -> list[dict]:
+    data = _read_json_cache(_planner_cache_file(session_id, "current_itinerary"))
+    nodes = data.get("nodes", [])
+    return nodes if isinstance(nodes, list) else []
+
+
+def write_node_alternatives_cache(session_id: str | None, alternatives_by_node: dict[str, dict]) -> None:
+    _write_json_cache(
+        _planner_cache_file(session_id, "node_alternatives"),
+        {
+            "session_id": session_id,
+            "updated_at": time.time(),
+            "nodes": alternatives_by_node or {},
+        },
+    )
+
+
+def read_node_alternatives_cache(session_id: str | None) -> dict:
+    data = _read_json_cache(_planner_cache_file(session_id, "node_alternatives"))
+    nodes = data.get("nodes", {})
+    return nodes if isinstance(nodes, dict) else {}
+
+
+def _write_planning_poi_cache(session_id: str | None, poi_data: dict[str, dict]) -> None:
+    try:
+        path = _planning_cache_path(session_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "session_id": session_id,
+            "updated_at": time.time(),
+            "items": list((poi_data or {}).values()),
+        }
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        logger.warning(f"[AgentPlan] failed to write POI cache: {exc}")
+
+
+def read_planning_poi_cache(session_id: str | None) -> list[dict]:
+    try:
+        path = _planning_cache_path(session_id)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = data.get("items", [])
+        return items if isinstance(items, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception as exc:
+        logger.warning(f"[AgentPlan] failed to read POI cache: {exc}")
+        return []
+
+
+def update_planning_poi_cache(session_id: str | None,
+                              remove_poi_id: str | None = None,
+                              add_item: dict | None = None) -> None:
+    items = read_planning_poi_cache(session_id)
+    remove_poi_id = remove_poi_id or ""
+    add_poi_id = (add_item or {}).get("poi_id") or (add_item or {}).get("poiId") or ""
+    next_items = []
+    for item in items:
+        pid = item.get("poi_id") or item.get("poiId")
+        if pid and (pid == remove_poi_id or pid == add_poi_id):
+            continue
+        next_items.append(item)
+    if add_item and add_poi_id:
+        normalized = dict(add_item)
+        normalized["poi_id"] = add_poi_id
+        next_items.append(normalized)
+    _write_planning_poi_cache(
+        session_id,
+        {
+            (item.get("poi_id") or item.get("poiId") or f"item_{idx}"): item
+            for idx, item in enumerate(next_items)
+        },
+    )
+
+
+def _write_ranked_planning_poi_cache(session_id: str | None,
+                                     state: dict,
+                                     session_facts: dict,
+                                     preferences: dict) -> None:
+    sf_for_score = {
+        **dict(session_facts or {}),
+        "food_preferences": preferences.get("food") or session_facts.get("food_preferences") or [],
+    }
+    activities = sorted(
+        [dict(item) for item in (state.get("seen_activities") or []) if item.get("open_status") != "closed"],
+        key=lambda item: _score_activity(item, sf_for_score),
+        reverse=True,
+    )[:8]
+    restaurants = sorted(
+        [dict(item) for item in (state.get("seen_restaurants") or []) if item.get("open_status") != "closed"],
+        key=lambda item: _score_restaurant(item, sf_for_score),
+        reverse=True,
+    )[:8]
+    ranked: dict[str, dict] = {}
+    for group, items in (("activity", activities), ("restaurant", restaurants)):
+        for index, item in enumerate(items, 1):
+            poi_id = item.get("poi_id") or item.get("poiId")
+            if not poi_id:
+                continue
+            ranked[poi_id] = {
+                **item,
+                "poi_id": poi_id,
+                "type": item.get("type") or group,
+                "alternative_group": group,
+                "alternative_rank": index,
+            }
+    _write_planning_poi_cache(session_id, ranked)
 
 
 
@@ -169,6 +323,28 @@ def _normalize_start_time_for_math(value: str, fallback: str = "14:00") -> int:
     return parsed if parsed is not None else 14 * 60
 
 
+def _planned_end_for_search(planned_time: str, duration_min: int) -> str | None:
+    try:
+        return _format_start_time(
+            _normalize_start_time_for_math(planned_time) + int(duration_min)
+        )
+    except Exception:
+        return None
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_distance_text(value, default: float = 0.0) -> str:
+    return f"{_safe_float(value, default):.1f}公里"
+
+
 def parse_time_and_duration_updates(message: str,
                                     previous_facts: dict | None = None) -> dict:
     """Extract explicit monitoring-stage schedule edits from natural language."""
@@ -239,11 +415,7 @@ def parse_time_and_duration_updates(message: str,
 
 def _default_start_time_from_current(current_time: str) -> str:
     current_min = _normalize_start_time_for_math(current_time, "14:00")
-    target = current_min + 60
-    remainder = target % 30
-    if remainder:
-        target += 30 - remainder
-    return _format_start_time(target)
+    return _format_start_time(current_min)
 
 
 def _detect_specific_preferences_core(message: str) -> dict:
@@ -401,6 +573,24 @@ def merge_specific_preferences(session_facts: dict, preferences: dict, message: 
     facts = dict(session_facts or {})
     prefs = dict(preferences or {})
     detected = detect_specific_preferences(message or "")
+    text = message or ""
+    child_mentioned = any(w in text for w in _CHILD_MARKERS)
+    if child_mentioned or _child_context_present(facts, text):
+        facts["has_children"] = True
+        facts["scenario"] = "family"
+        companions = list(facts.get("companions") or [])
+        if "child" not in companions:
+            companions.append("child")
+        facts["companions"] = companions
+        facts["child_confirmed_by_user"] = True
+        child_age = _extract_child_age(text)
+        if child_age is not None:
+            facts["child_age"] = child_age
+            facts["child_age_confirmed_by_user"] = True
+        child_purpose = _infer_child_purpose(text)
+        if child_purpose:
+            facts["child_purpose"] = child_purpose
+            facts["child_purpose_confirmed_by_user"] = True
     schedule_updates = parse_time_and_duration_updates(message or "", facts)
     if schedule_updates:
         facts.update(schedule_updates)
@@ -526,10 +716,24 @@ def _sanitize_identity_fields(facts: dict, user_message: str = "") -> dict:
         clean["companions"].append("spouse")
 
     child_mentioned = any(w in msg for w in _CHILD_MARKERS)
+    explicit_child_age = _extract_child_age(msg)
+    explicit_child_purpose = _infer_child_purpose(msg)
     if child_mentioned:
         clean["child_confirmed_by_user"] = True
+        clean["has_children"] = True
+        clean["scenario"] = "family"
         if "child" not in clean["companions"]:
             clean["companions"].append("child")
+        if explicit_child_age is not None:
+            clean["child_age"] = explicit_child_age
+            clean["child_age_confirmed_by_user"] = True
+        elif clean.get("child_age") is not None and not clean.get("child_age_confirmed_by_user"):
+            clean["child_age"] = None
+        if explicit_child_purpose:
+            clean["child_purpose"] = explicit_child_purpose
+            clean["child_purpose_confirmed_by_user"] = True
+        elif clean.get("child_purpose") and not clean.get("child_purpose_confirmed_by_user"):
+            clean["child_purpose"] = None
     elif clean.get("has_children") and not clean.get("child_confirmed_by_user"):
         clean["has_children"] = False
         clean["child_age"] = None
@@ -566,6 +770,85 @@ def _sanitize_identity_fields(facts: dict, user_message: str = "") -> dict:
     return clean
 
 
+def _child_context_present(facts: dict, message: str = "") -> bool:
+    companions = facts.get("companions") or []
+    return (
+        bool(facts.get("has_children"))
+        or "child" in companions
+        or bool(facts.get("child_age"))
+        or any(w in (message or "") for w in _CHILD_MARKERS)
+    )
+
+
+def _infer_child_purpose(text: str = "") -> str | None:
+    if any(w in (text or "") for w in ("科普", "博物馆", "科技馆", "自然馆", "学习", "涨知识", "展览")):
+        return "education"
+    if any(w in (text or "") for w in ("纯粹", "好玩", "游玩", "乐园", "游乐", "玩就好", "开心")):
+        return "fun"
+    return None
+
+
+def _extract_child_age(text: str = "") -> int | None:
+    match = re.search(r"(\d{1,2})\s*(?:岁|周岁)", text or "")
+    if not match:
+        match = re.search(r"(?:孩子|娃|小朋友|宝贝|儿子|女儿).{0,6}?(\d{1,2})", text or "")
+    if not match:
+        return None
+    try:
+        age = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return age if 0 < age < 18 else None
+
+
+def required_missing_fields(facts: dict, message: str = "") -> list[str]:
+    missing = []
+    if _child_context_present(facts or {}, message):
+        if not _has_value((facts or {}).get("child_age")):
+            missing.append("child_age")
+        if not _has_value((facts or {}).get("child_purpose")):
+            missing.append("child_purpose")
+    return missing
+
+
+def enforce_required_clarifications(result: dict, message: str = "") -> dict:
+    """Apply non-prompt mandatory follow-up rules to clarify output."""
+    fixed = dict(result or {})
+    inferred = dict(fixed.get("inferred") or {})
+    missing = list(fixed.get("missing_fields") or [])
+
+    if _child_context_present(inferred, message):
+        inferred["has_children"] = True
+        inferred["scenario"] = "family"
+        companions = list(inferred.get("companions") or [])
+        if "child" not in companions:
+            companions.append("child")
+        inferred["companions"] = companions
+        inferred["child_confirmed_by_user"] = True
+        if not inferred.get("child_purpose"):
+            inferred["child_purpose"] = _infer_child_purpose(message)
+
+    for field in required_missing_fields(inferred, message):
+        if field not in missing:
+            missing.append(field)
+
+    if "child_age" in missing or "child_purpose" in missing:
+        question_parts = []
+        if "child_age" in missing:
+            question_parts.append("孩子大概几岁")
+        if "child_purpose" in missing:
+            question_parts.append("这次更偏科普学习（博物馆/科技馆）还是纯粹好玩")
+        followup = "另外我需要确认：" + "？".join(question_parts) + "？"
+        msg = str(fixed.get("confirm_message") or "").strip()
+        if followup not in msg:
+            fixed["confirm_message"] = f"{msg}\n{followup}" if msg else followup
+        fixed["confidence"] = "medium"
+
+    fixed["inferred"] = inferred
+    fixed["missing_fields"] = missing
+    return fixed
+
+
 def merge_confirmed_state(previous_facts: dict,
                           previous_preferences: dict,
                           new_facts: dict,
@@ -580,15 +863,23 @@ def merge_confirmed_state(previous_facts: dict,
     """
     facts = dict(previous_facts or {})
     prefs = dict(previous_preferences or {})
+    incoming_facts = dict(new_facts or {})
 
-    for key, value in (new_facts or {}).items():
+    explicit_child_age = _extract_child_age(user_message or "")
+    explicit_child_purpose = _infer_child_purpose(user_message or "")
+    if explicit_child_age is None:
+        incoming_facts.pop("child_age", None)
+        incoming_facts.pop("child_age_confirmed_by_user", None)
+    if explicit_child_purpose is None:
+        incoming_facts.pop("child_purpose", None)
+        incoming_facts.pop("child_purpose_confirmed_by_user", None)
+
+    for key, value in incoming_facts.items():
         if isinstance(value, list):
             facts[key] = _merge_lists(facts.get(key, []), value)
         elif isinstance(value, bool) and facts.get(key) is True and value is False and not _explicit_negative_update(user_message):
             continue
         elif _has_value(value):
-            facts[key] = value
-        elif key not in facts:
             facts[key] = value
 
     for key, value in (new_preferences or {}).items():
@@ -597,8 +888,6 @@ def merge_confirmed_state(previous_facts: dict,
         elif isinstance(value, bool) and prefs.get(key) is True and value is False and not _explicit_negative_update(user_message):
             continue
         elif _has_value(value):
-            prefs[key] = value
-        elif key not in prefs:
             prefs[key] = value
 
     # Keep the two representations in sync for planner + profile panel.
@@ -614,6 +903,10 @@ def merge_confirmed_state(previous_facts: dict,
 
     facts, prefs = merge_specific_preferences(facts, prefs, user_message or "")
     facts = _sanitize_identity_fields(facts, user_message or "")
+    if not _has_value(facts.get("start_time")):
+        facts["start_time"] = _default_start_time_from_current(time.strftime("%H:%M"))
+    if not _has_value(facts.get("duration_hours")):
+        facts["duration_hours"] = 3
     return facts, prefs
 
 
@@ -720,12 +1013,26 @@ def enforce_planning_tool_args(name: str,
     """Force confirmed user demands into search tool parameters."""
     patched = dict(args or {})
     if name == "search_restaurants":
+        start_time = session_facts.get("start_time") or "14:00"
+        if not patched.get("planned_time"):
+            patched["planned_time"] = start_time
+        if not patched.get("planned_end_time"):
+            planned_end = _planned_end_for_search(patched["planned_time"], 60)
+            if planned_end:
+                patched["planned_end_time"] = planned_end
         food = preferences.get("food") or session_facts.get("food_preferences") or []
         if food:
             existing = [p.strip() for p in str(patched.get("preferences", "")).split(",") if p.strip()]
             patched["preferences"] = ",".join(_append_unique(existing, list(food)))
 
     if name == "search_activities":
+        start_time = session_facts.get("start_time") or "14:00"
+        if not patched.get("planned_time"):
+            patched["planned_time"] = start_time
+        if not patched.get("planned_end_time"):
+            planned_end = _planned_end_for_search(patched["planned_time"], 90)
+            if planned_end:
+                patched["planned_end_time"] = planned_end
         venue = preferences.get("venue") or session_facts.get("venue_preference")
         activity_pref = session_facts.get("activity_preference")
         categories = [c.strip() for c in str(patched.get("categories", "")).split(",") if c.strip()]
@@ -1205,8 +1512,8 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
         return
 
     scenario = session_facts.get("scenario", "family")
-    start_time = session_facts.get("start_time", "10:00")
-    duration_hours = float(session_facts.get("duration_hours", 3))
+    start_time = session_facts.get("start_time") or _default_start_time_from_current(time.strftime("%H:%M"))
+    duration_hours = _safe_float(session_facts.get("duration_hours"), 3.0)
 
     # Derive end_time from start + duration if not explicitly stored
     raw_end = session_facts.get("end_time")
@@ -1444,6 +1751,8 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
     seen_poi_ids:  set[str]        = set()
     seen_poi_data: dict[str, dict] = {}
     seen_poi_ids.add("walk_001")  # always allow walk nodes
+    session_id = session_facts.get("_session_id") or session_facts.get("session_id")
+    _write_planning_poi_cache(session_id, seen_poi_data)
     planning_state = {
         "user_context": {"session_facts": session_facts, "preferences": preferences},
         "weather": None,
@@ -1460,7 +1769,7 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
         "route_exec_count": 0,
     }
 
-    MAX_ITERATIONS = 15
+    MAX_ITERATIONS = 8
     consecutive_tool_errors = 0  # counter for auto-replan trigger
     finish_reject_count = 0      # counter for finish_planning ID rejection
 
@@ -1529,10 +1838,19 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
                 if len(valid_nodes) >= 2:
                     # Accept: normalize field names and enrich display data from search results
                     enriched = _clamp_nodes_to_day(_enrich_nodes(valid_nodes, seen_poi_data))
+                    summary = args.get("summary", "")
+                    no_restaurant_reason = ""
+                    if (
+                        not skip_restaurant
+                        and not planning_state.get("seen_restaurants")
+                        and not any(n.get("type") == "restaurant" or n.get("category") == "restaurant" for n in enriched)
+                    ):
+                        no_restaurant_reason = "没有找到满足时间/偏好/营业状态的可用餐厅，已将餐厅时段降级替换为合适活动"
+                        summary = no_restaurant_reason if not summary else f"{summary}；{no_restaurant_reason}"
                     plan = {
                         "nodes": enriched,
-                        "summary": args.get("summary", ""),
-                        "cot":     args.get("cot", []),
+                        "summary": summary,
+                        "cot":     [*args.get("cot", []), *([no_restaurant_reason] if no_restaurant_reason else [])],
                     }
                     yield {"_type": "cot_step", "text": f"✅ Agent 完成规划：{plan['summary']}"}
                     yield {"_type": "result", "plan": plan}
@@ -1654,6 +1972,7 @@ async def run_agent_plan(session_facts: dict, preferences: dict):
                     pid = item.get("poi_id", "")
                     if pid:
                         seen_poi_data[pid] = item
+                _write_ranked_planning_poi_cache(session_id, planning_state, session_facts, preferences)
 
             processed.append((tc, tool_result))
 
@@ -1695,8 +2014,8 @@ def _auto_build_plan_from_data(seen_poi_data: dict,
     """Build minimal valid plan from already-searched POI data when LLM repeatedly hallucinates IDs."""
     activities  = [v for v in seen_poi_data.values() if v.get("type") == "activity"]
     restaurants = [v for v in seen_poi_data.values() if v.get("type") == "restaurant"]
-    activities.sort(key=lambda x: x.get("rating", 0), reverse=True)
-    restaurants.sort(key=lambda x: x.get("rating", 0), reverse=True)
+    activities.sort(key=lambda x: _safe_float(x.get("rating"), 0), reverse=True)
+    restaurants.sort(key=lambda x: _safe_float(x.get("rating"), 0), reverse=True)
 
     start_time = session_facts.get("start_time", "14:00")
     try:
@@ -1726,10 +2045,13 @@ def _auto_build_plan_from_data(seen_poi_data: dict,
             "sub": act.get("address", ""),
             "timeStart": fmt(cur_h, cur_m),
             "timeEnd": fmt(eh, em),
-            "distance": f"{act.get('distance_km', 0):.1f}公里",
+            "distance": _safe_distance_text(act.get("distance_km")),
             "queueMin": q,
             "queueText": f"约{q}分钟" if q else "无需排队",
             "price": f"¥{act.get('ticket_price', 0)}/位" if act.get("ticket_price") else "免费",
+            "ticket_price": act.get("ticket_price"),
+            "purchase_required": bool(act.get("ticket_price")),
+            "ticket_required": bool(act.get("ticket_price")),
             "rating": act.get("rating"),
             "tags": list(act.get("tags", []))[:3],
             "reason": "评分最高候选",
@@ -1755,10 +2077,13 @@ def _auto_build_plan_from_data(seen_poi_data: dict,
             "sub": rst.get("address", ""),
             "timeStart": fmt(cur_h, cur_m),
             "timeEnd": fmt(eh, em),
-            "distance": f"{rst.get('distance_km', 0):.1f}公里",
+            "distance": _safe_distance_text(rst.get("distance_km")),
             "queueMin": q,
             "queueText": f"约{q}分钟" if q > 0 else "无需排队",
             "price": f"¥{rst.get('avg_price', 80)}/位",
+            "ticket_price": None,
+            "purchase_required": False,
+            "ticket_required": False,
             "rating": rst.get("rating"),
             "tags": list(rst.get("tags", []))[:3],
             "reason": "评分最高餐厅",
@@ -1908,7 +2233,8 @@ def _auto_finish_from_planning_state(state: dict, session_facts: dict,
     activities = list(state.get("seen_activities") or [])
     restaurants = [] if skip_restaurant else list(state.get("seen_restaurants") or [])
     if not activities and not restaurants:
-        return {"nodes": [], "summary": "", "cot": ["规划状态中没有可用候选"]}
+        reason = "活动和餐厅候选均为空，无法提供备用规划或降级方案"
+        return {"nodes": [], "summary": reason, "no_plan_reason": reason, "cot": [reason]}
 
     sf_for_score = {
         **dict(session_facts or {}),
@@ -1924,6 +2250,9 @@ def _auto_finish_from_planning_state(state: dict, session_facts: dict,
         key=lambda item: _score_restaurant(item, sf_for_score),
         reverse=True,
     )
+    if not activities:
+        reason = "没有找到可用活动候选，无法提供备用规划或降级方案"
+        return {"nodes": [], "summary": reason, "no_plan_reason": reason, "cot": [reason]}
 
     start_time = session_facts.get("start_time", "14:00")
     try:
@@ -1953,7 +2282,10 @@ def _auto_finish_from_planning_state(state: dict, session_facts: dict,
 
     cur_h, cur_m = add_min(sh, sm, 20)
     nodes = []
-    selected_activities = activities[:2]
+    no_restaurant_reason = ""
+    if not restaurants and not skip_restaurant:
+        no_restaurant_reason = "没有找到满足时间/偏好/营业状态的可用餐厅，已将餐厅时段降级替换为合适活动"
+    selected_activities = activities[:3] if no_restaurant_reason else activities[:2]
     selected_restaurants = restaurants[:1]
     route_risks = state.get("route_risks") or []
     risky_destination_ids = {
@@ -1995,10 +2327,13 @@ def _auto_finish_from_planning_state(state: dict, session_facts: dict,
             "sub": act.get("address", ""),
             "timeStart": fmt(cur_h, cur_m),
             "timeEnd": fmt(eh, em),
-            "distance": f"{act.get('distance_km', 0):.1f}公里",
+            "distance": _safe_distance_text(act.get("distance_km")),
             "queueMin": q,
             "queueText": f"约{q}分钟" if q > 0 else "无需排队",
             "price": f"¥{act.get('ticket_price', 0)}/位" if act.get("ticket_price") else "免费",
+            "ticket_price": act.get("ticket_price"),
+            "purchase_required": bool(act.get("ticket_price")),
+            "ticket_required": bool(act.get("ticket_price")),
             "rating": act.get("rating"),
             "tags": tags,
             "reason": str(reason)[:30],
@@ -2027,10 +2362,13 @@ def _auto_finish_from_planning_state(state: dict, session_facts: dict,
             "sub": rst.get("address", ""),
             "timeStart": fmt(cur_h, cur_m),
             "timeEnd": fmt(eh, em),
-            "distance": f"{rst.get('distance_km', 0):.1f}公里",
+            "distance": _safe_distance_text(rst.get("distance_km")),
             "queueMin": q,
             "queueText": f"约{q}分钟" if q > 0 else "无需排队",
             "price": f"¥{rst.get('avg_price', 80)}/位",
+            "ticket_price": None,
+            "purchase_required": False,
+            "ticket_required": False,
             "rating": rst.get("rating"),
             "tags": tags,
             "reason": str(reason)[:30],
@@ -2043,7 +2381,8 @@ def _auto_finish_from_planning_state(state: dict, session_facts: dict,
         })
 
     if len(nodes) < 2:
-        return {"nodes": [], "summary": "", "cot": ["候选数据不足，无法自动收束"]}
+        reason = "可用候选不足 2 个节点，无法提供备用规划或降级方案"
+        return {"nodes": [], "summary": reason, "no_plan_reason": reason, "cot": [reason]}
 
     nodes = _clamp_nodes_to_day(nodes)
     route_count = len(state.get("route_results") or {})
@@ -2057,10 +2396,11 @@ def _auto_finish_from_planning_state(state: dict, session_facts: dict,
     )
     return {
         "nodes": nodes,
-        "summary": f"已基于实时候选自动收束：{nodes[0]['name']} → {nodes[-1]['name']}",
+        "summary": no_restaurant_reason or f"已基于实时候选自动收束：{nodes[0]['name']} → {nodes[-1]['name']}",
         "cot": [
             "后端检测到规划信息已满足完成条件，自动收束",
             "候选地点来自 Mock API 参数化搜索结果",
+            *([no_restaurant_reason] if no_restaurant_reason else []),
             f"天气：{weather.get('condition', 'unknown')}",
             f"路线估算结果：{route_count} 组",
             route_note,
@@ -2093,7 +2433,7 @@ def _enrich_nodes(nodes: list[dict], poi_data: dict[str, dict]) -> list[dict]:
         rating   = n.get("rating") or src.get("rating")
         tags     = n.get("tags")   or src.get("tags") or []
         dist_km  = src.get("distance_km")
-        distance = f"{dist_km:.1f}公里" if dist_km else n.get("distance", "")
+        distance = _safe_distance_text(dist_km) if dist_km is not None else n.get("distance", "")
 
         queue_min  = src.get("queue_min")
         queue_text = n.get("queueText")
@@ -2124,6 +2464,11 @@ def _enrich_nodes(nodes: list[dict], poi_data: dict[str, dict]) -> list[dict]:
             "queueMin":         queue_min,
             "queueText":        queue_text,
             "price":            price_str,
+            "ticket_price":     n.get("ticket_price") if n.get("ticket_price") is not None else src.get("ticket_price"),
+            "purchase_required": n.get("purchase_required", bool(src.get("ticket_price"))),
+            "ticket_required":   n.get("ticket_required", bool(src.get("ticket_price"))),
+            "requires_user_action": n.get("requires_user_action", False),
+            "manual_action_required": n.get("manual_action_required", False),
             "rating":           rating,
             "tags":             list(tags)[:3],
             "reason":           str(reason)[:30] if reason else "",
@@ -2135,6 +2480,9 @@ def _enrich_nodes(nodes: list[dict], poi_data: dict[str, dict]) -> list[dict]:
             "transit":          n.get("transit"),
             "risk_facts":       src.get("risk_facts", []),
             "business_hours":   src.get("business_hours", ""),
+            "open_time":        src.get("open_time", ""),
+            "close_time":       src.get("close_time", ""),
+            "is_24h":           src.get("is_24h", False),
         })
     return result
 
@@ -2181,10 +2529,10 @@ async def clarify_needs(message: str, current_time: str, location_hint: str = ""
             schema_hint='{"inferred":{...},"confirm_message":"...","missing_fields":[]}',
             max_tokens=1024,
         )
-        return result
+        return enforce_required_clarifications(result, message)
     except Exception as e:
         logger.error(f"clarify_needs failed: {e}")
-        return _fallback_clarify(message, current_time)
+        return enforce_required_clarifications(_fallback_clarify(message, current_time), message)
 
 
 def _fallback_clarify(message: str, current_time: str, location_hint: str = "") -> dict:
@@ -2249,7 +2597,7 @@ def _fallback_clarify(message: str, current_time: str, location_hint: str = "") 
 
     missing = []
     if has_child:
-        missing = ['child_age']
+        missing = ['child_age', 'child_purpose']
 
     lines = [f"好的！我帮你推测了一下本次出行：\n"]
     if scenario == 'family':
@@ -2272,10 +2620,11 @@ def _fallback_clarify(message: str, current_time: str, location_hint: str = "") 
         lines.append("🍽️ 餐食安排：已吃过/不安排餐食")
     if has_child:
         lines.append(f"👶 孩子年龄：（还没填，帮我补充一下？）")
+        lines.append("🎯 孩子偏好：科普学习（博物馆/科技馆）还是纯粹好玩？")
     if has_elderly:
         lines.append(f"👴 已考虑老人体力限制")
 
-    lines.append(f"\n有什么需要纠正或补充的吗？{('（孩子多大？）' if has_child else '')}")
+    lines.append(f"\n有什么需要纠正或补充的吗？{('（孩子多大？更偏科普还是纯玩？）' if has_child else '')}")
 
     inferred = {
         "scenario": scenario,
@@ -2285,6 +2634,7 @@ def _fallback_clarify(message: str, current_time: str, location_hint: str = "") 
         "companions": companions,
         "has_children": has_child,
         "child_age": None,
+        "child_purpose": None,
         "has_elderly": has_elderly,
         "special_needs": (['dietary_restriction'] if food_prefs else []),
         "travel_style": style,
@@ -2366,9 +2716,14 @@ def _fallback_confirm_prefs(inferred: dict, user_response: str) -> dict:
     prefs = dict(inferred)
 
     # Extract child age
-    age_match = re.search(r'(\d+)\s*岁', user_response)
-    if age_match:
-        prefs['child_age'] = int(age_match.group(1))
+    child_age = _extract_child_age(user_response)
+    if child_age is not None:
+        prefs['child_age'] = child_age
+        prefs["child_age_confirmed_by_user"] = True
+    child_purpose = _infer_child_purpose(user_response)
+    if child_purpose:
+        prefs['child_purpose'] = child_purpose
+        prefs["child_purpose_confirmed_by_user"] = True
 
     # Extract start time override
     time_match = re.search(r'(\d{1,2})\s*[点:时]', user_response)
@@ -2404,7 +2759,9 @@ def _fallback_confirm_prefs(inferred: dict, user_response: str) -> dict:
         "start_time": prefs.get('start_time', '14:00'),
         "duration_hours": prefs.get('duration_hours', 3),
         "companions": prefs.get('companions', ['family']),
+        "has_children": bool(prefs.get("has_children") or prefs.get("child_age") or "child" in (prefs.get("companions") or [])),
         "child_age": prefs.get('child_age'),
+        "child_purpose": prefs.get("child_purpose"),
         "has_elderly": prefs.get('has_elderly', False),
         "special_needs": prefs.get('special_needs', []),
         "home_area": "北京望京",
@@ -2497,11 +2854,11 @@ def _fallback_preferences(message: str, tags: list, scenario: str) -> dict:
         elif "2点" in t: start_time = "14:00"
         elif "3点" in t: start_time = "15:00"
 
-    child_age, companions = None, (["spouse"] if scenario == "family" else ["friends"])
-    if any("孩子" in t or "岁" in t for t in tags):
-        child_age = 5; companions.append("child")
-
     tagged_text = " ".join(tags) + " " + message
+    child_age = _extract_child_age(tagged_text)
+    companions = (["spouse"] if scenario == "family" else ["friends"])
+    if any("孩子" in t or "岁" in t for t in tags) or any(w in tagged_text for w in _CHILD_MARKERS):
+        companions.append("child")
     detected = detect_specific_preferences(tagged_text)
     food = detected.get("food", [])
 
@@ -2509,6 +2866,9 @@ def _fallback_preferences(message: str, tags: list, scenario: str) -> dict:
         "session_facts": {
             "scenario": scenario, "start_time": start_time,
             "companions": companions, "child_age": child_age, "home_area": "北京望京",
+            "has_children": "child" in companions,
+            "child_confirmed_by_user": "child" in companions,
+            "child_age_confirmed_by_user": child_age is not None,
             "has_elderly": False, "special_needs": [], "travel_style": "relaxed",
             "food_preferences": food,
             "venue_preference": detected.get("venue"),
@@ -2655,11 +3015,13 @@ async def plan_itinerary(activities: list, restaurants: list, weather: dict,
     pref = prefs.get("preferences", {})
 
     act_fields = ["poi_id", "name", "category", "distance_km", "business_hours",
+                  "open_time", "close_time", "is_24h",
                   "booking_required", "queue_min", "estimated_duration_min",
                   "venue", "age_policy", "risk_facts", "open_status", "availability",
                   "available_slots"]
     rst_fields = ["poi_id", "name", "distance_km", "queue_min", "rating",
                   "avg_price", "facilities", "menu_features", "business_hours",
+                  "open_time", "close_time", "is_24h",
                   "risk_facts", "location_features"]
 
     # Pre-compute first node time so LLM can't get it wrong
@@ -2764,7 +3126,7 @@ def _score_activity(act: dict, sf: dict) -> float:
         score += 1.5
 
     # Distance (prefer closer; active users tolerate farther)
-    dist = act.get("distance_km", 5.0)
+    dist = _safe_float(act.get("distance_km"), 5.0)
     max_dist = 15.0 if style == "active" else 8.0
     if dist <= max_dist:
         score += max(0, 2.5 - dist * 0.2)
@@ -2795,7 +3157,7 @@ def _score_activity(act: dict, sf: dict) -> float:
         score -= 0.5
 
     # Rating bonus
-    rating = act.get("rating", 4.0)
+    rating = _safe_float(act.get("rating"), 4.0)
     score += (rating - 4.0) * 1.5
 
     return score
@@ -2815,11 +3177,11 @@ def _score_restaurant(rst: dict, sf: dict) -> float:
         score += 1.5
 
     # Distance
-    dist = rst.get("distance_km", 3.0)
+    dist = _safe_float(rst.get("distance_km"), 3.0)
     score += max(0, 2.0 - dist * 0.15)
 
     # Queue time (shorter = better)
-    q = rst.get("queue_min", 0)
+    q = int(_safe_float(rst.get("queue_min"), 0))
     if q > 45:
         score -= 2.0
     elif q < 15:
@@ -2838,7 +3200,7 @@ def _score_restaurant(rst: dict, sf: dict) -> float:
         score += 1.5
 
     # Rating bonus
-    rating = rst.get("rating", 4.0)
+    rating = _safe_float(rst.get("rating"), 4.0)
     score += (rating - 4.0) * 1.5
 
     return score
@@ -2911,9 +3273,12 @@ def _fallback_plan(activities: list, restaurants: list, prefs: dict, mode: str) 
             "name": act["name"], "sub": act.get("address", ""),
             "timeStart": fmt(cur_h, cur_m), "timeEnd": fmt(eh, em),
             "duration": f"约{dur//60}小时{dur%60 if dur%60 else ''}{'分钟' if dur%60 else ''}",
-            "distance": f"{act.get('distance_km',0):.1f}公里",
+            "distance": _safe_distance_text(act.get("distance_km")),
             "queueMin": 0, "queueText": "无需排队",
             "price": f"¥{act.get('ticket_price',88)}/位" if act.get("ticket_price") else "免费",
+            "ticket_price": act.get("ticket_price"),
+            "purchase_required": bool(act.get("ticket_price")),
+            "ticket_required": bool(act.get("ticket_price")),
             "rating": act.get("rating", 4.5),
             "tags": act_tags,
             "reason": reason[:25] or "距离近，体验好",
@@ -2934,9 +3299,12 @@ def _fallback_plan(activities: list, restaurants: list, prefs: dict, mode: str) 
             "name": rst["name"], "sub": rst.get("address", ""),
             "timeStart": fmt(cur_h, cur_m), "timeEnd": fmt(eh, em),
             "duration": "约1小时",
-            "distance": f"{rst.get('distance_km',0):.1f}公里",
+            "distance": _safe_distance_text(rst.get("distance_km")),
             "queueMin": q, "queueText": f"约{q}分钟" if q > 0 else "无需排队",
             "price": f"¥{rst.get('avg_price',80)}/位",
+            "ticket_price": None,
+            "purchase_required": False,
+            "ticket_required": False,
             "rating": rst.get("rating", 4.5),
             "tags": rst_tags,
             "reason": (rst.get("tags", [""])[0] or "口碑好")[:25],
@@ -3028,7 +3396,7 @@ def _fallback_replan(event: dict, alternatives: dict) -> dict:
             "icon": "🥗" if etype == "queue_spike" else "🎨",
             "sub": best.get("address", "同商圈内"),
             "queueText": f"约{best.get('queue_min',15)}分钟",
-            "distance": f"{best.get('distance_km',1.0):.1f}公里",
+            "distance": _safe_distance_text(best.get("distance_km"), 1.0),
             "tags": best.get("menu_features", [])[:2] or ["室内"],
             "reason": msg[:25],
         },

@@ -1,4 +1,4 @@
-/* ── Tokens ─────────────────────────────────────────────────────── */
+﻿/* ── Tokens ─────────────────────────────────────────────────────── */
 :root {
   --primary:        #FF6200;
   --primary-light:  #FFF3EC;
@@ -398,6 +398,12 @@ textarea { font-family: inherit; border: none; outline: none; resize: none; }
 .alt-name { font-size: var(--font-sm); font-weight: 600; color: var(--gray-1); }
 .alt-meta { font-size: var(--font-xs); color: var(--gray-4); margin-top: 1px; }
 .alt-rating { font-size: var(--font-xs); color: #FFAA00; font-weight: 700; }
+.alt-more-btn {
+  width: 100%; border: 0; border-radius: var(--radius-md);
+  background: var(--primary-light); color: var(--primary);
+  padding: 8px 10px; font-size: var(--font-sm); font-weight: 700;
+  cursor: pointer;
+}
 
 /* ── Fulfillment box ─────────────────────────────────────────────── */
 .fulfill-box {
@@ -1429,4 +1435,48 @@ textarea { font-family: inherit; border: none; outline: none; resize: none; }
   .monitor-panel { display: none; }
   .up-panel { display: none; }
   .monitor-toggle-btn { display: flex; }
+}
+
+.nc-time-edit {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+}
+
+.nc-time-edit:hover {
+  text-decoration: underline;
+}
+
+.nc-time-editor {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.nc-time-editor input[type="time"] {
+  width: 76px;
+  border: 1px solid var(--gray-5);
+  border-radius: 6px;
+  padding: 2px 4px;
+  font-size: 12px;
+  background: var(--white);
+}
+
+.nc-time-save,
+.nc-time-cancel {
+  border: 1px solid var(--gray-5);
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 12px;
+  background: var(--white);
+  cursor: pointer;
+}
+
+.nc-time-save {
+  border-color: var(--primary);
+  color: var(--primary);
 }
